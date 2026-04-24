@@ -1,9 +1,15 @@
 from pathlib import Path
 import sys
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.db import Base, ensure_sqlite_schema
 from app.services.feature_extractor import extract_page_features
+from app.services.keyword_parser import parse_keywords
+from app.models import AnalysisKeyword, AnalysisRun, SerpResult
 from app.services.scoring import score_page_feature
 
 
@@ -30,6 +36,63 @@ class _DummyFeature:
 
 
 def main() -> None:
+    assert parse_keywords("обучение Python с нуля\nкурс Python онлайн") == [
+        "обучение Python с нуля",
+        "курс Python онлайн",
+    ]
+    assert parse_keywords("онлайн школа, обучение с ИИ, онлайн школа") == [
+        "онлайн школа",
+        "обучение с ИИ",
+    ]
+    assert parse_keywords("  ключ 1  \n\n ключ 2 , ключ 1 ,   ") == [
+        "ключ 1",
+        "ключ 2",
+    ]
+    assert parse_keywords("") == []
+
+    test_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=test_engine)
+    ensure_sqlite_schema(test_engine)
+
+    with TestingSessionLocal() as db:
+        run = AnalysisRun(query="ключ 1\nключ 2", target_url="https://example.com", status="created")
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+
+        db.add_all(
+            [
+                AnalysisKeyword(run_id=run.id, keyword="ключ 1"),
+                AnalysisKeyword(run_id=run.id, keyword="ключ 2"),
+            ]
+        )
+        db.commit()
+
+        saved_keywords = (
+            db.query(AnalysisKeyword)
+            .filter(AnalysisKeyword.run_id == run.id)
+            .order_by(AnalysisKeyword.id.asc())
+            .all()
+        )
+        assert [item.keyword for item in saved_keywords] == ["ключ 1", "ключ 2"]
+
+        serp_result = SerpResult(
+            analysis_run_id=run.id,
+            keyword_id=saved_keywords[0].id,
+            position=1,
+            url="https://example.com/result",
+            title="Example result",
+            snippet="Example snippet",
+            domain="example.com",
+            is_target=True,
+        )
+        db.add(serp_result)
+        db.commit()
+        db.refresh(serp_result)
+
+        assert serp_result.keyword_id == saved_keywords[0].id
+
     html = """
     <html>
       <head>

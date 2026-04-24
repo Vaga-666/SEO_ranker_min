@@ -23,10 +23,25 @@ class AnalysisRun(Base):
     )
 
     serp_results: Mapped[list["SerpResult"]] = relationship(back_populates="analysis_run")
+    keywords: Mapped[list["AnalysisKeyword"]] = relationship(back_populates="analysis_run")
     page_snapshots: Mapped[list["PageSnapshot"]] = relationship(back_populates="analysis_run")
     page_features: Mapped[list["PageFeature"]] = relationship(back_populates="analysis_run")
     page_scores: Mapped[list["PageScore"]] = relationship(back_populates="analysis_run")
     recommendations: Mapped[list["Recommendation"]] = relationship(back_populates="analysis_run")
+
+
+class AnalysisKeyword(Base):
+    __tablename__ = "analysis_keywords"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("analysis_runs.id"), nullable=False, index=True)
+    keyword: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(64), default="pending", nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    analysis_run: Mapped[AnalysisRun] = relationship(back_populates="keywords")
+    serp_results: Mapped[list["SerpResult"]] = relationship(back_populates="keyword")
 
 
 class SerpResult(Base):
@@ -34,6 +49,7 @@ class SerpResult(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     analysis_run_id: Mapped[int] = mapped_column(ForeignKey("analysis_runs.id"), nullable=False, index=True)
+    keyword_id: Mapped[int | None] = mapped_column(ForeignKey("analysis_keywords.id"), nullable=True, index=True)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     url: Mapped[str] = mapped_column(String(2048), nullable=False)
     title: Mapped[str] = mapped_column(String(1024), nullable=False)
@@ -43,6 +59,7 @@ class SerpResult(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     analysis_run: Mapped[AnalysisRun] = relationship(back_populates="serp_results")
+    keyword: Mapped[AnalysisKeyword | None] = relationship(back_populates="serp_results")
 
 
 class PageSnapshot(Base):

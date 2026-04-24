@@ -2,11 +2,25 @@
 
 {% block content %}
   <h1>SEO Ranker MVP</h1>
-  <p class="lead">Запустите анализ: поисковый запрос + целевой URL.</p>
+  <p class="lead">Запустите анализ: ключевые слова + целевой URL.</p>
 
   <form method="post" action="/analyze" class="card js-analyze-form">
-    <label for="query">Поисковая фраза</label>
-    <input id="query" name="query" type="text" required placeholder="купить велосипед" />
+    {% if form_error %}
+      <p class="hint"><strong>{{ form_error }}</strong></p>
+    {% endif %}
+
+    <label for="keywords">Ключевые слова</label>
+    <textarea
+      id="keywords"
+      name="keywords"
+      rows="8"
+      required
+      placeholder="купить велосипед&#10;велосипед для города, велосипед для новичка"
+    >{{ form_values.keywords if form_values else "" }}</textarea>
+    <input id="query" name="query" type="hidden" />
+    <p class="hint">
+      Введите ключевые слова: каждое с новой строки. Также поддерживается разделение через запятую.
+    </p>
 
     <label for="target_url">Целевой URL</label>
     <input
@@ -15,6 +29,7 @@
       type="url"
       required
       placeholder="https://example.com/page"
+      value="{{ form_values.target_url if form_values else '' }}"
     />
 
     <label for="manual_top_urls">Ручной top-10 URL (опционально)</label>
@@ -23,7 +38,7 @@
       name="manual_top_urls"
       rows="6"
       placeholder="https://site1.ru/page\nhttps://site2.ru/page"
-    ></textarea>
+    >{{ form_values.manual_top_urls if form_values else "" }}</textarea>
     <p class="hint">
       Если поле заполнено, анализ пройдет по этим URL и не будет обращаться к Yandex SERP.
     </p>
@@ -53,10 +68,17 @@
       var progressPercent = form.querySelector(".js-progress-percent");
       var progressText = form.querySelector(".js-progress-text");
       var progressTrack = form.querySelector(".progress-track");
+      var keywordsField = form.querySelector("#keywords");
+      var queryField = form.querySelector("#query");
       var timer = null;
       var progressValue = 5;
       var runStatusUrl = null;
       var runDetailUrl = null;
+
+      function syncLegacyQuery() {
+        if (!queryField || !keywordsField) return;
+        queryField.value = keywordsField.value.trim();
+      }
 
       function setProgress(value, text) {
         progressValue = Math.max(0, Math.min(100, value));
@@ -111,8 +133,14 @@
         }
       }
 
+      if (keywordsField) {
+        keywordsField.addEventListener("input", syncLegacyQuery);
+        syncLegacyQuery();
+      }
+
       form.addEventListener("submit", async function (event) {
         event.preventDefault();
+        syncLegacyQuery();
         if (submitBtn) {
           submitBtn.disabled = true;
           submitBtn.textContent = "Запускаем...";
@@ -127,7 +155,14 @@
           });
 
           if (!response.ok) {
-            throw new Error("HTTP " + response.status);
+            var errorText = "Не удалось запустить анализ. Проверьте поля и попробуйте снова.";
+            try {
+              var errorPayload = await response.json();
+              errorText = errorPayload.detail || errorText;
+            } catch (parseError) {
+              console.error(parseError);
+            }
+            throw new Error(errorText);
           }
 
           var payload = await response.json();
@@ -138,7 +173,7 @@
           pollProgress();
         } catch (error) {
           stopPolling();
-          setProgress(100, "Не удалось запустить анализ. Проверьте поля и попробуйте снова.");
+          setProgress(100, error && error.message ? error.message : "Не удалось запустить анализ. Проверьте поля и попробуйте снова.");
           if (submitBtn) {
             submitBtn.disabled = false;
             submitBtn.textContent = "Запустить анализ";

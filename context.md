@@ -464,3 +464,36 @@
   - добавлены правила для локальных env/секретов (`.env`, `.env.local`, `.env.*.local`);
   - сохранено игнорирование локальной БД и артефактов (`seo_ranker.db`, `artifacts/`);
   - добавлены правила для IDE-файлов (`.idea`, `.vscode`).
+## Шаг 28 (2026-04-24)
+- Проект переведен с модели `один run = один query` на модель `один run = группа keywords`.
+- На главной странице:
+  - поле одного запроса заменено на `textarea` `keywords`;
+  - поддерживается ввод по строкам и через запятую;
+  - сохранена обратная совместимость через поле `query`.
+- В БД и модели:
+  - добавлена таблица `analysis_keywords`;
+  - каждое ключевое слово сохраняется отдельно со статусом (`pending`, `running`, `done`, `failed`);
+  - `serp_results` теперь может быть связан с `keyword_id`.
+- Пайплайн обновлен без переписывания с нуля:
+  - при старте run backend разбирает `keywords` через `parse_keywords(...)`;
+  - если `analysis_keywords` пустой, используется fallback из `analysis_runs.query`;
+  - SERP собирается отдельно по каждому keyword;
+  - ошибки отдельных ключей не валят весь run, поддерживается partial-режим;
+  - `manual_top_urls` применяется как fallback для всей группы keywords;
+  - downstream-этапы `pages -> scoring -> AI -> recommendations` продолжают работать поверх объединенного набора `serp_results`.
+- Debug и статусы:
+  - в `debug_log.jsonl` добавлены события `keyword_start`, `keyword_done`, `keyword_failed`;
+  - в `debug_result_summary.json` добавлены счетчики по `analysis_keywords`;
+  - progress endpoint и UI получили статусы для multi-keyword flow (`running_keywords`, `serp_collected_partial`, `serp_collected_manual_partial`);
+  - progress message теперь может показывать вид `Ключ 2 из 8`.
+- UI страницы результата (`/runs/{run_id}`) обновлен:
+  - ключевые слова показываются отдельным списком со статусами;
+  - `analysis_runs.query` отображается как `Исходный ввод`, а не как основной запрос;
+  - Top-10 таблица группируется по каждому keyword;
+  - если по keyword нет SERP, показывается отдельное сообщение и `error_message`.
+- AI и Codex контекст обновлены:
+  - `ai_analyzer` и `codex_advisor` получают список `keywords`;
+  - если `analysis_keywords` пустой, используется fallback через `parse_keywords(run.query)`;
+  - в prompts добавлено правило: не анализировать keywords как одну длинную фразу;
+  - `codex_advice.json` теперь содержит `keywords`, а `codex_task_prompt` включает блок `Целевые SEO-запросы:`.
+- README синхронизирован с новым форматом ввода и multi-keyword pipeline.

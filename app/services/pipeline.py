@@ -9,88 +9,152 @@ from urllib.parse import urlparse
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import AnalysisRun, PageFeature, PageScore, PageSnapshot, Recommendation, SerpResult
+from app.models import AnalysisKeyword, AnalysisRun, PageFeature, PageScore, PageSnapshot, Recommendation, SerpResult
 from app.scoring_config import SCORING_WEIGHTS
 from app.services.ai_analyzer import page_analyzer, serp_intent_analyzer
 from app.services.codex_advisor import codex_fix_advisor
 from app.services.debug_io import append_run_log, save_run_json
 from app.services.feature_extractor import extract_page_features
 from app.services.gap_analysis import build_basic_gap_recommendations
+from app.services.keyword_parser import parse_keywords
 from app.services.page_fetch import fetch_page_html
 from app.services.scoring import score_page_feature
 from app.services.serp_yandex import fetch_yandex_top10, fetch_yandex_top10_interactive
 
 
-def run_analysis_step_serp(db: Session, run: AnalysisRun) -> None:
+def run_analysis_step_serp(db: Session, run: AnalysisRun, keyword_id: int | None = None) -> None:
     append_run_log(run.id, "pipeline.start", query=run.query, target_url=run.target_url)
-    run.status = "running"
+    run.status = "running_keywords"
     db.add(run)
     db.commit()
     append_run_log(run.id, "serp.start", status=run.status)
 
     run_dir = Path("artifacts") / "runs" / str(run.id)
-    try:
-        serp_data = fetch_yandex_top10(query=run.query, run_dir=run_dir)
+    keywords = _load_or_create_keywords(db=db, run=run, keyword_id=keyword_id)
+    db.query(SerpResult).filter(SerpResult.analysis_run_id == run.id).delete()
+    db.commit()
+
+    collected_keywords = 0
+    failed_keywords = 0
+    total_saved = 0
+
+    for index, keyword in enumerate(keywords, start=1):
+        _mark_keyword_running(db=db, keyword=keyword)
         append_run_log(
             run.id,
-            "serp.fetched",
-            items_count=len(serp_data.items),
-            html_path=serp_data.html_path,
-            screenshot_path=serp_data.screenshot_path,
-            attempts=serp_data.attempts,
-            note=serp_data.note,
+            "keyword_start",
+            keyword_id=keyword.id,
+            keyword_index=index,
+            keyword_count=len(keywords),
+            keyword_text=keyword.keyword,
         )
-    except Exception as exc:
-        error_text = _format_exception(exc)
-        lowered = error_text.lower()
-        if "captcha" in lowered or "robot" in lowered:
-            run.status = "captcha_detected"
-        else:
-            run.status = "failed"
-        run.error_message = f"SERP fetch error: {error_text}"
-        db.add(run)
+        try:
+            serp_data = fetch_yandex_top10(query=keyword.keyword, run_dir=run_dir)
+            append_run_log(
+                run.id,
+                "serp.fetched",
+                keyword_id=keyword.id,
+                keyword_index=index,
+                keyword_count=len(keywords),
+                keyword_text=keyword.keyword,
+                items_count=len(serp_data.items),
+                html_path=serp_data.html_path,
+                screenshot_path=serp_data.screenshot_path,
+                attempts=serp_data.attempts,
+                note=serp_data.note,
+            )
+        except Exception as exc:
+            error_text = _format_exception(exc)
+            lowered = error_text.lower()
+            if "captcha" in lowered or "robot" in lowered:
+                keyword.status = "captcha_detected"
+                keyword.error_message = error_text
+                run.status = "captcha_detected"
+                run.error_message = f"SERP fetch error: {error_text}"
+                db.add_all([keyword, run])
+                db.commit()
+                append_run_log(
+                    run.id,
+                    "keyword_failed",
+                    keyword_id=keyword.id,
+                    keyword_index=index,
+                    keyword_count=len(keywords),
+                    keyword_text=keyword.keyword,
+                    error=error_text,
+                    traceback=traceback.format_exc(),
+                )
+                append_run_log(
+                    run.id,
+                    "serp.failed",
+                    status=run.status,
+                    error=run.error_message,
+                    keyword_id=keyword.id,
+                    keyword_text=keyword.keyword,
+                    traceback=traceback.format_exc(),
+                )
+                _save_debug_summary(db=db, run=run)
+                return
+
+            failed_keywords += 1
+            keyword.status = "failed"
+            keyword.error_message = error_text
+            db.add(keyword)
+            db.commit()
+            append_run_log(
+                run.id,
+                "keyword_failed",
+                keyword_id=keyword.id,
+                keyword_index=index,
+                keyword_count=len(keywords),
+                keyword_text=keyword.keyword,
+                error=error_text,
+                traceback=traceback.format_exc(),
+            )
+            continue
+
+        saved_count = _save_keyword_serp_results(db=db, run=run, keyword=keyword, items=serp_data.items)
+        total_saved += saved_count
+        if saved_count > 0:
+            collected_keywords += 1
+        keyword.status = "done"
+        keyword.error_message = None if saved_count > 0 else f"SERP empty: {serp_data.note or 'unknown_reason'}"
+        db.add(keyword)
         db.commit()
         append_run_log(
             run.id,
-            "serp.failed",
-            status=run.status,
-            error=run.error_message,
-            traceback=traceback.format_exc(),
-        )
-        _save_debug_summary(db=db, run=run)
-        return
-
-    db.query(SerpResult).filter(SerpResult.analysis_run_id == run.id).delete()
-
-    for item in serp_data.items:
-        is_target = _same_domain(item.url, run.target_url)
-        db.add(
-            SerpResult(
-                analysis_run_id=run.id,
-                position=item.position,
-                url=item.url,
-                title=item.title,
-                snippet=item.snippet,
-                domain=item.domain,
-                is_target=is_target,
-            )
+            "keyword_done",
+            keyword_id=keyword.id,
+            keyword_index=index,
+            keyword_count=len(keywords),
+            keyword_text=keyword.keyword,
+            saved_count=saved_count,
         )
 
-    run.status = "serp_collected" if serp_data.items else "no_results"
-    if not serp_data.items:
-        run.error_message = f"SERP empty: {serp_data.note or 'unknown_reason'}"
-    else:
-        run.error_message = None
+    run.status, run.error_message = _build_serp_completion_status(
+        collected_keywords=collected_keywords,
+        failed_keywords=failed_keywords,
+        empty_keywords=len(keywords) - collected_keywords - failed_keywords,
+        interactive=False,
+        manual=False,
+    )
     db.add(run)
     db.commit()
-    append_run_log(run.id, "serp.saved", status=run.status, saved_count=len(serp_data.items))
+    append_run_log(
+        run.id,
+        "serp.saved",
+        status=run.status,
+        saved_count=total_saved,
+        keywords_total=len(keywords),
+        keywords_collected=collected_keywords,
+        keywords_failed=failed_keywords,
+    )
     _save_debug_summary(db=db, run=run)
 
-    if serp_data.items:
+    if total_saved > 0:
         run_analysis_step_pages(db=db, run=run, run_dir=run_dir)
 
 
-def run_analysis_step_serp_interactive(db: Session, run: AnalysisRun) -> None:
+def run_analysis_step_serp_interactive(db: Session, run: AnalysisRun, keyword_id: int | None = None) -> None:
     append_run_log(run.id, "serp.interactive.start", status=run.status)
     run.status = "running_interactive_serp"
     run.error_message = None
@@ -98,74 +162,155 @@ def run_analysis_step_serp_interactive(db: Session, run: AnalysisRun) -> None:
     db.commit()
 
     run_dir = Path("artifacts") / "runs" / str(run.id)
-    try:
-        serp_data = fetch_yandex_top10_interactive(query=run.query, run_dir=run_dir)
+    keywords = _load_or_create_keywords(db=db, run=run, keyword_id=keyword_id)
+    pending_keywords = [row for row in keywords if row.status != "done"]
+    if not pending_keywords:
+        pending_keywords = keywords
+
+    collected_keywords = 0
+    failed_keywords = 0
+    total_saved = 0
+
+    for index, keyword in enumerate(pending_keywords, start=1):
+        _mark_keyword_running(db=db, keyword=keyword)
         append_run_log(
             run.id,
-            "serp.interactive.fetched",
-            items_count=len(serp_data.items),
-            html_path=serp_data.html_path,
-            screenshot_path=serp_data.screenshot_path,
-            attempts=serp_data.attempts,
-            note=serp_data.note,
+            "keyword_start",
+            keyword_id=keyword.id,
+            keyword_index=index,
+            keyword_count=len(pending_keywords),
+            keyword_text=keyword.keyword,
+            mode="interactive",
         )
-    except Exception as exc:
-        error_text = _format_exception(exc)
-        lowered = error_text.lower()
-        if "captcha" in lowered or "robot" in lowered:
-            run.status = "captcha_detected"
-        else:
-            run.status = "failed"
-        run.error_message = f"SERP interactive error: {error_text}"
-        db.add(run)
+        try:
+            serp_data = fetch_yandex_top10_interactive(query=keyword.keyword, run_dir=run_dir)
+            append_run_log(
+                run.id,
+                "serp.interactive.fetched",
+                keyword_id=keyword.id,
+                keyword_index=index,
+                keyword_count=len(pending_keywords),
+                keyword_text=keyword.keyword,
+                items_count=len(serp_data.items),
+                html_path=serp_data.html_path,
+                screenshot_path=serp_data.screenshot_path,
+                attempts=serp_data.attempts,
+                note=serp_data.note,
+            )
+        except Exception as exc:
+            error_text = _format_exception(exc)
+            lowered = error_text.lower()
+            if "captcha" in lowered or "robot" in lowered:
+                keyword.status = "captcha_detected"
+                keyword.error_message = error_text
+                run.status = "captcha_detected"
+                run.error_message = f"SERP interactive error: {error_text}"
+                db.add_all([keyword, run])
+                db.commit()
+                append_run_log(
+                    run.id,
+                    "keyword_failed",
+                    keyword_id=keyword.id,
+                    keyword_index=index,
+                    keyword_count=len(pending_keywords),
+                    keyword_text=keyword.keyword,
+                    mode="interactive",
+                    error=error_text,
+                    traceback=traceback.format_exc(),
+                )
+                append_run_log(
+                    run.id,
+                    "serp.interactive.failed",
+                    status=run.status,
+                    error=run.error_message,
+                    keyword_id=keyword.id,
+                    keyword_text=keyword.keyword,
+                    traceback=traceback.format_exc(),
+                )
+                _save_debug_summary(db=db, run=run)
+                return
+
+            failed_keywords += 1
+            keyword.status = "failed"
+            keyword.error_message = error_text
+            db.add(keyword)
+            db.commit()
+            append_run_log(
+                run.id,
+                "keyword_failed",
+                keyword_id=keyword.id,
+                keyword_index=index,
+                keyword_count=len(pending_keywords),
+                keyword_text=keyword.keyword,
+                mode="interactive",
+                error=error_text,
+                traceback=traceback.format_exc(),
+            )
+            continue
+
+        saved_count = _save_keyword_serp_results(db=db, run=run, keyword=keyword, items=serp_data.items)
+        total_saved += saved_count
+        if saved_count > 0:
+            collected_keywords += 1
+        keyword.status = "done"
+        keyword.error_message = None if saved_count > 0 else f"SERP empty: {serp_data.note or 'unknown_reason'}"
+        db.add(keyword)
         db.commit()
         append_run_log(
             run.id,
-            "serp.interactive.failed",
-            status=run.status,
-            error=run.error_message,
-            traceback=traceback.format_exc(),
-        )
-        _save_debug_summary(db=db, run=run)
-        return
-
-    db.query(SerpResult).filter(SerpResult.analysis_run_id == run.id).delete()
-    for item in serp_data.items:
-        is_target = _same_domain(item.url, run.target_url)
-        db.add(
-            SerpResult(
-                analysis_run_id=run.id,
-                position=item.position,
-                url=item.url,
-                title=item.title,
-                snippet=item.snippet,
-                domain=item.domain,
-                is_target=is_target,
-            )
+            "keyword_done",
+            keyword_id=keyword.id,
+            keyword_index=index,
+            keyword_count=len(pending_keywords),
+            keyword_text=keyword.keyword,
+            mode="interactive",
+            saved_count=saved_count,
         )
 
-    run.status = "serp_collected_interactive" if serp_data.items else "no_results"
-    if not serp_data.items:
-        run.error_message = f"SERP empty: {serp_data.note or 'unknown_reason'}"
-    else:
-        run.error_message = None
+    existing_keyword_ids_with_results = (
+        db.query(SerpResult.keyword_id)
+        .filter(SerpResult.analysis_run_id == run.id, SerpResult.keyword_id.is_not(None))
+        .distinct()
+        .all()
+    )
+    total_keywords_with_results = len(existing_keyword_ids_with_results)
+    total_failed_keywords = db.query(AnalysisKeyword).filter(
+        AnalysisKeyword.run_id == run.id,
+        AnalysisKeyword.status == "failed",
+    ).count()
+
+    run.status, run.error_message = _build_serp_completion_status(
+        collected_keywords=total_keywords_with_results,
+        failed_keywords=total_failed_keywords,
+        empty_keywords=max(0, len(keywords) - total_keywords_with_results - total_failed_keywords),
+        interactive=True,
+        manual=False,
+    )
     db.add(run)
     db.commit()
     append_run_log(
         run.id,
         "serp.interactive.saved",
         status=run.status,
-        saved_count=len(serp_data.items),
+        saved_count=total_saved,
+        keywords_total=len(keywords),
+        keywords_collected=total_keywords_with_results,
+        keywords_failed=total_failed_keywords,
     )
     _save_debug_summary(db=db, run=run)
 
-    if serp_data.items:
+    if total_keywords_with_results > 0:
         run_analysis_step_pages(db=db, run=run, run_dir=run_dir)
 
 
-def run_analysis_with_manual_serp(db: Session, run: AnalysisRun, manual_urls: list[str]) -> None:
+def run_analysis_with_manual_serp(
+    db: Session,
+    run: AnalysisRun,
+    manual_urls: list[str],
+    keyword_id: int | None = None,
+) -> None:
     append_run_log(run.id, "manual_serp.start", manual_urls_count=len(manual_urls))
-    run.status = "running_manual_serp"
+    run.status = "running_keywords"
     run.error_message = None
     db.add(run)
     db.commit()
@@ -174,27 +319,70 @@ def run_analysis_with_manual_serp(db: Session, run: AnalysisRun, manual_urls: li
     run_dir.mkdir(parents=True, exist_ok=True)
 
     db.query(SerpResult).filter(SerpResult.analysis_run_id == run.id).delete()
-    for idx, url in enumerate(manual_urls[:10], start=1):
-        domain = urlparse(url).netloc.lower().replace("www.", "")
-        db.add(
-            SerpResult(
-                analysis_run_id=run.id,
-                position=idx,
-                url=url,
-                title=f"Manual URL #{idx}",
-                snippet="Imported manually",
-                domain=domain,
-                is_target=_same_domain(url, run.target_url),
+    db.commit()
+
+    keywords = _load_or_create_keywords(db=db, run=run, keyword_id=keyword_id)
+    total_saved = 0
+    for keyword_index, keyword in enumerate(keywords, start=1):
+        _mark_keyword_running(db=db, keyword=keyword)
+        append_run_log(
+            run.id,
+            "keyword_start",
+            keyword_id=keyword.id,
+            keyword_index=keyword_index,
+            keyword_count=len(keywords),
+            keyword_text=keyword.keyword,
+            mode="manual",
+        )
+        db.query(SerpResult).filter(
+            SerpResult.analysis_run_id == run.id,
+            SerpResult.keyword_id == keyword.id,
+        ).delete()
+        for idx, url in enumerate(manual_urls[:10], start=1):
+            domain = urlparse(url).netloc.lower().replace("www.", "")
+            db.add(
+                SerpResult(
+                    analysis_run_id=run.id,
+                    keyword_id=keyword.id,
+                    position=idx,
+                    url=url,
+                    title=f"Manual URL #{idx}",
+                    snippet="Imported manually",
+                    domain=domain,
+                    is_target=_same_domain(url, run.target_url),
+                )
             )
+            total_saved += 1
+        keyword.status = "done"
+        keyword.error_message = None
+        db.add(keyword)
+        db.commit()
+        append_run_log(
+            run.id,
+            "keyword_done",
+            keyword_id=keyword.id,
+            keyword_index=keyword_index,
+            keyword_count=len(keywords),
+            keyword_text=keyword.keyword,
+            mode="manual",
+            saved_count=min(len(manual_urls), 10),
         )
 
-    run.status = "serp_collected_manual"
+    run.status = "serp_collected_manual" if total_saved > 0 else "no_results"
+    run.error_message = None if total_saved > 0 else "SERP empty: manual_top_urls"
     db.add(run)
     db.commit()
-    append_run_log(run.id, "manual_serp.saved", status=run.status, saved_count=min(len(manual_urls), 10))
+    append_run_log(
+        run.id,
+        "manual_serp.saved",
+        status=run.status,
+        saved_count=total_saved,
+        keywords_total=len(keywords),
+    )
     _save_debug_summary(db=db, run=run)
 
-    run_analysis_step_pages(db=db, run=run, run_dir=run_dir)
+    if total_saved > 0:
+        run_analysis_step_pages(db=db, run=run, run_dir=run_dir)
 
 
 def run_analysis_step_pages(db: Session, run: AnalysisRun, run_dir: Path) -> None:
@@ -385,6 +573,7 @@ def run_analysis_step_ai_and_recommendations(db: Session, run: AnalysisRun, had_
         .all()
     )
     scores = db.query(PageScore).filter(PageScore.analysis_run_id == run.id).all()
+    keywords = _get_keywords_for_context(db=db, run=run)
 
     score_map = {_normalize_url(s.source_url): s for s in scores}
     feature_map = {_normalize_url(f.source_url): f for f in features}
@@ -408,6 +597,7 @@ def run_analysis_step_ai_and_recommendations(db: Session, run: AnalysisRun, had_
 
     serp_summary = serp_intent_analyzer(
         query=run.query,
+        keywords=keywords,
         top_results=top_results_short,
         page_features_short=page_features_short,
         run_id=run.id,
@@ -423,6 +613,7 @@ def run_analysis_step_ai_and_recommendations(db: Session, run: AnalysisRun, had_
     for feature in features:
         ai_result = page_analyzer(
             query=run.query,
+            keywords=keywords,
             serp_summary=serp_summary,
             feature=feature,
             run_id=run.id,
@@ -518,6 +709,102 @@ def _same_domain(url_a: str, url_b: str) -> bool:
     return bool(host_a and host_b and host_a == host_b)
 
 
+def _load_or_create_keywords(db: Session, run: AnalysisRun, keyword_id: int | None = None) -> list[AnalysisKeyword]:
+    query = db.query(AnalysisKeyword).filter(AnalysisKeyword.run_id == run.id)
+    if keyword_id is not None:
+        query = query.filter(AnalysisKeyword.id == keyword_id)
+    keywords = query.order_by(AnalysisKeyword.id.asc()).all()
+    if keywords:
+        return keywords
+
+    parsed_keywords = parse_keywords(run.query)
+    if not parsed_keywords and run.query.strip():
+        parsed_keywords = [run.query.strip()]
+
+    created_rows: list[AnalysisKeyword] = []
+    for keyword_text in parsed_keywords:
+        row = AnalysisKeyword(run_id=run.id, keyword=keyword_text, status="pending")
+        db.add(row)
+        created_rows.append(row)
+    db.commit()
+
+    if keyword_id is not None:
+        return [row for row in created_rows if row.id == keyword_id]
+    return created_rows
+
+
+def _get_keywords_for_context(db: Session, run: AnalysisRun) -> list[str]:
+    keyword_rows = _load_or_create_keywords(db=db, run=run)
+    keywords = [row.keyword.strip() for row in keyword_rows if row.keyword and row.keyword.strip()]
+    if keywords:
+        return keywords
+
+    fallback_keywords = parse_keywords(run.query)
+    if fallback_keywords:
+        return fallback_keywords
+    return [run.query.strip()] if run.query.strip() else []
+
+
+def _mark_keyword_running(db: Session, keyword: AnalysisKeyword) -> None:
+    keyword.status = "running"
+    keyword.error_message = None
+    db.add(keyword)
+    db.commit()
+
+
+def _save_keyword_serp_results(db: Session, run: AnalysisRun, keyword: AnalysisKeyword, items: list) -> int:
+    db.query(SerpResult).filter(
+        SerpResult.analysis_run_id == run.id,
+        SerpResult.keyword_id == keyword.id,
+    ).delete()
+
+    saved_count = 0
+    for item in items:
+        is_target = _same_domain(item.url, run.target_url)
+        db.add(
+            SerpResult(
+                analysis_run_id=run.id,
+                keyword_id=keyword.id,
+                position=item.position,
+                url=item.url,
+                title=item.title,
+                snippet=item.snippet,
+                domain=item.domain,
+                is_target=is_target,
+            )
+        )
+        saved_count += 1
+
+    db.commit()
+    return saved_count
+
+
+def _build_serp_completion_status(
+    collected_keywords: int,
+    failed_keywords: int,
+    empty_keywords: int,
+    interactive: bool,
+    manual: bool,
+) -> tuple[str, str | None]:
+    if collected_keywords <= 0:
+        if failed_keywords > 0:
+            return "no_results", "Ни одно ключевое слово не дало результатов."
+        return "no_results", "SERP empty: no keyword results"
+
+    if failed_keywords > 0 or empty_keywords > 0:
+        if manual:
+            return "serp_collected_manual_partial", "Часть ключевых слов не дала результатов."
+        if interactive:
+            return "serp_collected_partial", "Часть ключевых слов не дала результатов."
+        return "serp_collected_partial", "Часть ключевых слов не дала результатов."
+
+    if manual:
+        return "serp_collected_manual", None
+    if interactive:
+        return "serp_collected_interactive", None
+    return "serp_collected", None
+
+
 def _urls_match(url_a: str, url_b: str) -> bool:
     return url_a.rstrip("/") == url_b.rstrip("/")
 
@@ -560,6 +847,15 @@ def _format_exception(exc: Exception) -> str:
 
 
 def _save_debug_summary(db: Session, run: AnalysisRun) -> None:
+    keywords_count = db.query(AnalysisKeyword).filter(AnalysisKeyword.run_id == run.id).count()
+    keywords_done = db.query(AnalysisKeyword).filter(
+        AnalysisKeyword.run_id == run.id,
+        AnalysisKeyword.status == "done",
+    ).count()
+    keywords_failed = db.query(AnalysisKeyword).filter(
+        AnalysisKeyword.run_id == run.id,
+        AnalysisKeyword.status == "failed",
+    ).count()
     serp_count = db.query(SerpResult).filter(SerpResult.analysis_run_id == run.id).count()
     snapshot_count = db.query(PageSnapshot).filter(PageSnapshot.analysis_run_id == run.id).count()
     feature_count = db.query(PageFeature).filter(PageFeature.analysis_run_id == run.id).count()
@@ -572,6 +868,9 @@ def _save_debug_summary(db: Session, run: AnalysisRun) -> None:
         "status": run.status,
         "error_message": run.error_message,
         "counts": {
+            "analysis_keywords": keywords_count,
+            "analysis_keywords_done": keywords_done,
+            "analysis_keywords_failed": keywords_failed,
             "serp_results": serp_count,
             "page_snapshots": snapshot_count,
             "page_features": feature_count,
@@ -604,6 +903,7 @@ def _save_codex_advice(db: Session, run: AnalysisRun, summary_payload: dict) -> 
 
 
 def _build_codex_context(db: Session, run: AnalysisRun, summary_payload: dict) -> dict:
+    keywords = _get_keywords_for_context(db=db, run=run)
     serp_results = (
         db.query(SerpResult)
         .filter(SerpResult.analysis_run_id == run.id)
@@ -669,6 +969,7 @@ def _build_codex_context(db: Session, run: AnalysisRun, summary_payload: dict) -
     return {
         "run_id": run.id,
         "query": run.query,
+        "keywords": keywords,
         "target_url": run.target_url,
         "status": run.status,
         "error_message": run.error_message,

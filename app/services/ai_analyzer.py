@@ -11,6 +11,7 @@ from app.services.debug_io import append_run_log
 
 def serp_intent_analyzer(
     query: str,
+    keywords: list[str],
     top_results: list[dict[str, Any]],
     page_features_short: list[dict[str, Any]],
     run_id: int | None = None,
@@ -24,6 +25,12 @@ def serp_intent_analyzer(
     prompt = {
         "task": "Analyze SERP intent and output strict JSON.",
         "query": query,
+        "keywords": keywords,
+        "keyword_handling_rule": (
+            "Do not analyze keywords as one long phrase. "
+            "Each line / each list item is a separate search query. "
+            "Build one shared SEO strategy for the target page across the whole keyword group."
+        ),
         "top_results": top_results,
         "page_features_short": page_features_short,
         "output_schema": {
@@ -40,6 +47,7 @@ def serp_intent_analyzer(
 
 def page_analyzer(
     query: str,
+    keywords: list[str],
     serp_summary: dict[str, Any],
     feature: PageFeature,
     run_id: int | None = None,
@@ -59,6 +67,12 @@ def page_analyzer(
     payload = {
         "task": "Analyze page and output strict JSON scores and recommendations.",
         "query": query,
+        "keywords": keywords,
+        "keyword_handling_rule": (
+            "Do not analyze keywords as one long phrase. "
+            "Each line / each list item is a separate search query. "
+            "Build one shared SEO strategy for the target page across the whole keyword group."
+        ),
         "serp_summary": serp_summary,
         "page_features": {
             "source_url": feature.source_url,
@@ -120,7 +134,8 @@ def _ask_json(
                 {
                     "role": "system",
                     "content": (
-                        "You are an SEO analyst. Always return valid JSON only, no markdown, no prose."
+                        "You are an SEO analyst. Always return valid JSON only, no markdown, no prose. "
+                        "When keywords are provided as a list, treat each element as a separate query and build a shared SEO strategy."
                     ),
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -153,7 +168,8 @@ def _ask_json(
                     "role": "system",
                     "content": (
                         "You are an SEO analyst. Return valid JSON only. "
-                        "No markdown code fences, no comments."
+                        "No markdown code fences, no comments. "
+                        "When keywords are provided as a list, treat each element as a separate query and build a shared SEO strategy."
                     ),
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},

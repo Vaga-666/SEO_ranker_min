@@ -15,8 +15,17 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
-from app.db import Base, SessionLocal, engine, get_db
-from app.models import AnalysisRun, PageFeature, PageScore, PageSnapshot, Recommendation, SerpResult
+from app.db import Base, SessionLocal, engine, ensure_sqlite_schema, get_db
+from app.models import (
+    AnalysisKeyword,
+    AnalysisRun,
+    PageFeature,
+    PageScore,
+    PageSnapshot,
+    Recommendation,
+    SerpResult,
+)
+from app.services.keyword_parser import parse_keywords
 from app.services.pipeline import (
     run_analysis_step_ai_and_recommendations,
     run_analysis_step_serp,
@@ -32,6 +41,7 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 @app.on_event("startup")
 def startup() -> None:
     Base.metadata.create_all(bind=engine)
+    ensure_sqlite_schema(engine)
 
 
 @app.get("/")
@@ -39,22 +49,47 @@ def index(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={"page_title": "SEO Ranker MVP"},
+        context={
+            "page_title": "SEO Ranker MVP",
+            "form_error": None,
+            "form_values": {"keywords": "", "target_url": "", "manual_top_urls": ""},
+        },
     )
 
 
 @app.post("/analyze")
 def start_analysis(
     request: Request,
-    query: str = Form(...),
+    keywords: str = Form(""),
+    query: str = Form(""),
     target_url: str = Form(...),
     manual_top_urls: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    run = AnalysisRun(query=query.strip(), target_url=target_url.strip(), status="created")
-    db.add(run)
-    db.commit()
-    db.refresh(run)
+    raw_keywords = _resolve_raw_keywords(keywords=keywords, query=query)
+    keywords_list = parse_keywords(raw_keywords)
+    if not keywords_list:
+        return templates.TemplateResponse(
+            request=request,
+            name="index.html",
+            context={
+                "page_title": "SEO Ranker MVP",
+                "form_error": "Введите хотя бы одно ключевое слово",
+                "form_values": {
+                    "keywords": raw_keywords,
+                    "target_url": target_url,
+                    "manual_top_urls": manual_top_urls,
+                },
+            },
+            status_code=400,
+        )
+
+    run = _create_analysis_run(
+        db=db,
+        raw_keywords=raw_keywords,
+        keywords_list=keywords_list,
+        target_url=target_url,
+    )
 
     manual_urls = _parse_manual_urls(manual_top_urls)
     thread = threading.Thread(
@@ -92,15 +127,26 @@ def retry_captcha(run_id: int, request: Request, db: Session = Depends(get_db)):
 
 @app.post("/analyze-start")
 def start_analysis_json(
-    query: str = Form(...),
+    keywords: str = Form(""),
+    query: str = Form(""),
     target_url: str = Form(...),
     manual_top_urls: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    run = AnalysisRun(query=query.strip(), target_url=target_url.strip(), status="created")
-    db.add(run)
-    db.commit()
-    db.refresh(run)
+    raw_keywords = _resolve_raw_keywords(keywords=keywords, query=query)
+    keywords_list = parse_keywords(raw_keywords)
+    if not keywords_list:
+        return JSONResponse(
+            {"detail": "Введите хотя бы одно ключевое слово"},
+            status_code=400,
+        )
+
+    run = _create_analysis_run(
+        db=db,
+        raw_keywords=raw_keywords,
+        keywords_list=keywords_list,
+        target_url=target_url,
+    )
 
     manual_urls = _parse_manual_urls(manual_top_urls)
     thread = threading.Thread(
@@ -128,10 +174,13 @@ def rerun_ai_codex(run_id: int, request: Request, db: Session = Depends(get_db))
     running_statuses = {
         "created",
         "running",
+        "running_keywords",
         "running_manual_serp",
         "running_interactive_serp",
         "serp_collected",
+        "serp_collected_partial",
         "serp_collected_manual",
+        "serp_collected_manual_partial",
         "serp_collected_interactive",
         "pages_processed",
         "pages_processed_partial",
@@ -165,10 +214,16 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    keywords = (
+        db.query(AnalysisKeyword)
+        .filter(AnalysisKeyword.run_id == run.id)
+        .order_by(AnalysisKeyword.id.asc())
+        .all()
+    )
     serp_results = (
         db.query(SerpResult)
         .filter(SerpResult.analysis_run_id == run.id)
-        .order_by(SerpResult.position.asc())
+        .order_by(SerpResult.keyword_id.asc().nulls_first(), SerpResult.position.asc(), SerpResult.id.asc())
         .all()
     )
     snapshots = (
@@ -191,17 +246,50 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     feature_map = {row.source_url.rstrip("/"): row for row in page_features}
 
     top_rows = []
+    keyword_groups_map: dict[int | None, dict] = {
+        keyword.id: {
+            "keyword_id": keyword.id,
+            "keyword": keyword.keyword,
+            "status": keyword.status,
+            "error_message": keyword.error_message,
+            "rows": [],
+        }
+        for keyword in keywords
+    }
     for item in serp_results:
         score_row = score_map.get(item.url.rstrip("/"))
-        top_rows.append(
-            {
-                "real_position": item.position,
-                "our_position": score_row.internal_rank if score_row else None,
-                "url": item.url,
-                "title": item.title,
-                "total_score": round(score_row.total_score, 2) if score_row else None,
+        row_payload = {
+            "real_position": item.position,
+            "our_position": score_row.internal_rank if score_row else None,
+            "keyword": item.keyword.keyword if item.keyword else None,
+            "url": item.url,
+            "title": item.title,
+            "total_score": round(score_row.total_score, 2) if score_row else None,
+        }
+        top_rows.append(row_payload)
+        group = keyword_groups_map.get(item.keyword_id)
+        if group is None:
+            keyword_groups_map[item.keyword_id] = {
+                "keyword_id": item.keyword_id,
+                "keyword": item.keyword.keyword if item.keyword else "Без ключевого слова",
+                "status": "done",
+                "error_message": None,
+                "rows": [row_payload],
             }
-        )
+        else:
+            group["rows"].append(row_payload)
+
+    keyword_groups = list(keyword_groups_map.values())
+    if not keyword_groups and run.query.strip():
+        keyword_groups = [
+            {
+                "keyword_id": None,
+                "keyword": run.query,
+                "status": "pending",
+                "error_message": None,
+                "rows": [],
+            }
+        ]
 
     target_score = score_map.get(run.target_url.rstrip("/"))
     top_score_rows = [score_map.get(item.url.rstrip("/")) for item in serp_results]
@@ -238,11 +326,14 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     running_statuses = {
         "created",
         "running",
+        "running_keywords",
         "running_manual_serp",
         "running_interactive_serp",
         "running_ai_codex_manual",
         "serp_collected",
+        "serp_collected_partial",
         "serp_collected_manual",
+        "serp_collected_manual_partial",
         "serp_collected_interactive",
         "pages_processed",
         "pages_processed_partial",
@@ -252,10 +343,13 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     is_running = run.status in running_statuses
     running_seconds = int((datetime.utcnow() - run.created_at).total_seconds()) if is_running else 0
     status_hints = {
+        "running_keywords": "Идет поочередный сбор SERP по каждому ключевому слову.",
         "running_interactive_serp": "Открыто окно браузера, пройдите капчу и дождитесь завершения.",
         "running_ai_codex_manual": "Выполняем повторный AI-анализ и формируем рекомендации для Codex.",
         "running": "Идет сбор SERP.",
         "running_manual_serp": "Применяется ручной список top-10.",
+        "serp_collected_partial": "Часть ключевых слов собрана, продолжаем обработку доступных результатов.",
+        "serp_collected_manual_partial": "Часть ручных SERP-данных обработана, продолжаем анализ.",
         "pages_processed": "Идет расчет score и рекомендаций.",
         "pages_processed_partial": "Часть страниц обработана, продолжаем анализ по доступным данным.",
         "scored": "Идет AI-анализ и финальные рекомендации.",
@@ -268,6 +362,8 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
         context={
             "page_title": f"Run #{run.id}",
             "run": run,
+            "keywords": keywords,
+            "keyword_groups": keyword_groups,
             "serp_results": serp_results,
             "snapshots": snapshots,
             "features_count": features_count,
@@ -292,6 +388,7 @@ def run_progress(run_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Run not found")
 
     percent, message = _status_progress(run.status)
+    message = _build_keyword_progress_message(db=db, run=run, message=message)
     done_statuses = {
         "done_ai",
         "done_ai_partial",
@@ -565,17 +662,22 @@ def _run_ai_codex_background(run_id: int) -> None:
 def _status_progress(status: str) -> tuple[int, str]:
     mapping: dict[str, tuple[int, str]] = {
         "created": (3, "Создаем задачу..."),
-        "running": (15, "Собираем SERP..."),
-        "running_manual_serp": (15, "Применяем ручной top-10..."),
+        "running": (15, "Собираем выдачу по ключевым словам..."),
+        "running_keywords": (15, "Анализируем ключевые слова..."),
+        "running_keyword_serp": (18, "Собираем выдачу по ключевым словам..."),
+        "running_manual_serp": (15, "Применяем ручной top-10 по ключевым словам..."),
         "running_interactive_serp": (15, "Ожидаем прохождение капчи..."),
         "running_ai_codex_manual": (88, "Пересчитываем AI-анализ и рекомендации для Codex..."),
-        "serp_collected": (35, "SERP собран, начинаем обработку страниц..."),
-        "serp_collected_manual": (35, "Top-10 импортирован, начинаем обработку страниц..."),
-        "serp_collected_interactive": (35, "SERP собран после капчи, начинаем обработку страниц..."),
-        "pages_processed": (65, "Признаки страниц собраны, считаем score..."),
-        "pages_processed_partial": (65, "Часть страниц обработана, считаем score..."),
-        "scored": (82, "Скоры рассчитаны, запускаем AI-анализ..."),
-        "scored_partial": (82, "Скоры частично рассчитаны, запускаем AI-анализ..."),
+        "serp_collected": (35, "Обрабатываем страницы конкурентов..."),
+        "serp_collected_partial": (35, "Обрабатываем страницы конкурентов по доступным ключам..."),
+        "serp_collected_manual": (35, "Обрабатываем страницы конкурентов..."),
+        "serp_collected_manual_partial": (35, "Обрабатываем страницы конкурентов по доступным ключам..."),
+        "serp_collected_interactive": (35, "Обрабатываем страницы конкурентов..."),
+        "keywords_processed": (65, "Считаем SEO score..."),
+        "pages_processed": (65, "Считаем SEO score..."),
+        "pages_processed_partial": (65, "Считаем SEO score по доступным данным..."),
+        "scored": (82, "Готовим AI-анализ и рекомендации..."),
+        "scored_partial": (82, "Готовим AI-анализ и рекомендации по доступным данным..."),
         "done_ai": (100, "Готово: анализ завершен с AI."),
         "done_ai_partial": (100, "Готово: анализ завершен с AI (частично)."),
         "done_no_ai": (100, "Готово: анализ завершен без AI."),
@@ -586,6 +688,60 @@ def _status_progress(status: str) -> tuple[int, str]:
         "scoring_skipped": (100, "Скоринг пропущен: недостаточно данных."),
     }
     return mapping.get(status, (10, "Анализ выполняется..."))
+
+
+def _resolve_raw_keywords(keywords: str, query: str) -> str:
+    return (keywords or "").strip() or (query or "").strip()
+
+
+def _create_analysis_run(
+    db: Session,
+    raw_keywords: str,
+    keywords_list: list[str],
+    target_url: str,
+) -> AnalysisRun:
+    run = AnalysisRun(query=raw_keywords.strip() or keywords_list[0], target_url=target_url.strip(), status="created")
+    db.add(run)
+    db.flush()
+
+    for keyword in keywords_list:
+        db.add(AnalysisKeyword(run_id=run.id, keyword=keyword, status="pending"))
+
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def _build_keyword_progress_message(db: Session, run: AnalysisRun, message: str) -> str:
+    if run.status not in {
+        "running",
+        "running_keywords",
+        "running_keyword_serp",
+        "running_manual_serp",
+        "running_interactive_serp",
+        "serp_collected_partial",
+        "serp_collected_manual_partial",
+    }:
+        return message
+
+    keyword_rows = (
+        db.query(AnalysisKeyword)
+        .filter(AnalysisKeyword.run_id == run.id)
+        .order_by(AnalysisKeyword.id.asc())
+        .all()
+    )
+    total = len(keyword_rows)
+    if total <= 0:
+        return message
+
+    completed = sum(1 for row in keyword_rows if row.status in {"done", "failed"})
+    current_index = completed + 1 if completed < total else total
+    running = sum(1 for row in keyword_rows if row.status == "running")
+
+    suffix = f" Ключ {current_index} из {total}."
+    if running > 0 and completed < total:
+        suffix = f" Ключ {current_index} из {total} (в работе: {running})."
+    return message + suffix
 
 if __name__ == "__main__":
     import uvicorn

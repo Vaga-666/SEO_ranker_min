@@ -33,7 +33,21 @@
   {% endif %}
 
   <div class="card">
-    <p><strong>Запрос:</strong> {{ run.query }}</p>
+    <h2>Ключевые слова</h2>
+    {% if keyword_groups %}
+      <div class="keyword-list">
+        {% for item in keyword_groups %}
+          <div class="keyword-item">
+            <span>{{ item.keyword }}</span>
+            <span class="keyword-status keyword-status-{{ item.status }}">{{ item.status }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p>Ключевые слова пока не сохранены.</p>
+    {% endif %}
+
+    <p><strong>Исходный ввод:</strong> {{ run.query }}</p>
     <p><strong>URL:</strong> {{ run.target_url }}</p>
     <p><strong>Статус:</strong> {{ run.status }}</p>
     <p><strong>Создан:</strong> {{ run.created_at }}</p>
@@ -44,29 +58,41 @@
 
   <div class="card">
     <h2>Top-10 Таблица</h2>
-    {% if top_rows %}
-      <table class="results-table">
-        <thead>
-          <tr>
-            <th>Реальная позиция</th>
-            <th>Наша позиция</th>
-            <th>URL</th>
-            <th>Title</th>
-            <th>Total score</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in top_rows %}
-            <tr>
-              <td>{{ row.real_position }}</td>
-              <td>{{ row.our_position or "-" }}</td>
-              <td><a href="{{ row.url }}" target="_blank">{{ row.url }}</a></td>
-              <td>{{ row.title }}</td>
-              <td>{{ row.total_score if row.total_score is not none else "-" }}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+    {% if keyword_groups %}
+      {% for group in keyword_groups %}
+        <div class="keyword-serp-group">
+          <h3>Keyword: {{ group.keyword }}</h3>
+          <p class="hint">
+            Статус: <span class="keyword-status keyword-status-{{ group.status }}">{{ group.status }}</span>
+          </p>
+          {% if group.rows %}
+            <table class="results-table">
+              <thead>
+                <tr>
+                  <th>Реальная позиция</th>
+                  <th>Наша позиция</th>
+                  <th>URL</th>
+                  <th>Title</th>
+                  <th>Total score</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in group.rows %}
+                  <tr>
+                    <td>{{ row.real_position }}</td>
+                    <td>{{ row.our_position or "-" }}</td>
+                    <td><a href="{{ row.url }}" target="_blank">{{ row.url }}</a></td>
+                    <td>{{ row.title }}</td>
+                    <td>{{ row.total_score if row.total_score is not none else "-" }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% else %}
+            <p>По этому ключу SERP не собран{% if group.error_message %}: {{ group.error_message }}{% endif %}.</p>
+          {% endif %}
+        </div>
+      {% endfor %}
     {% else %}
       <p>Результаты SERP пока не собраны.</p>
     {% endif %}

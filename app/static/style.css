@@ -111,6 +111,60 @@ a {
   background: #eef4ff;
 }
 
+.keyword-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.keyword-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.keyword-status {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.keyword-status-pending {
+  background: #eef2ff;
+  color: #4338ca;
+}
+
+.keyword-status-running {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.keyword-status-done {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.keyword-status-failed,
+.keyword-status-captcha_detected {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.keyword-serp-group + .keyword-serp-group {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
 pre {
   white-space: pre-wrap;
   word-wrap: break-word;
