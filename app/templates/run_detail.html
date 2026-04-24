@@ -1,0 +1,354 @@
+﻿{% extends "base.html" %}
+
+{% block content %}
+  <h1>Запуск #{{ run.id }}</h1>
+  {% if is_running %}
+    <div class="card card-running">
+      <h2>Анализ выполняется</h2>
+      <p><strong>Прошло:</strong> {{ running_seconds }} сек</p>
+      {% if status_hint %}
+        <p>{{ status_hint }}</p>
+      {% endif %}
+      <p class="hint">Страница обновляется автоматически каждые 5 секунд.</p>
+    </div>
+    <script>
+      setTimeout(function () { window.location.reload(); }, 5000);
+    </script>
+  {% endif %}
+
+  {% if is_captcha %}
+    <div class="card card-warning">
+      <h2>Обнаружена капча Yandex</h2>
+      <p>
+        Автоматический сбор SERP остановлен из-за антибот-проверки. Можно повторить запуск через ручной top-10:
+        вставьте список URL на главной странице в поле «Ручной top-10 URL».
+      </p>
+      <form method="post" action="/runs/{{ run.id }}/retry-captcha">
+        <button type="submit">Открыть браузер и пройти капчу</button>
+      </form>
+      <p class="hint">
+        После нажатия откроется видимое окно браузера. Пройдите капчу вручную и подождите, пока система соберет выдачу.
+      </p>
+    </div>
+  {% endif %}
+
+  <div class="card">
+    <p><strong>Запрос:</strong> {{ run.query }}</p>
+    <p><strong>URL:</strong> {{ run.target_url }}</p>
+    <p><strong>Статус:</strong> {{ run.status }}</p>
+    <p><strong>Создан:</strong> {{ run.created_at }}</p>
+    {% if run.error_message %}
+      <p><strong>Ошибка:</strong> {{ run.error_message }}</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Top-10 Таблица</h2>
+    {% if top_rows %}
+      <table class="results-table">
+        <thead>
+          <tr>
+            <th>Реальная позиция</th>
+            <th>Наша позиция</th>
+            <th>URL</th>
+            <th>Title</th>
+            <th>Total score</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in top_rows %}
+            <tr>
+              <td>{{ row.real_position }}</td>
+              <td>{{ row.our_position or "-" }}</td>
+              <td><a href="{{ row.url }}" target="_blank">{{ row.url }}</a></td>
+              <td>{{ row.title }}</td>
+              <td>{{ row.total_score if row.total_score is not none else "-" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>Результаты SERP пока не собраны.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Сравнение target со средним top-10</h2>
+    {% if target_vs_top %}
+      <table class="results-table">
+        <thead>
+          <tr>
+            <th>Метрика</th>
+            <th>Target</th>
+            <th>Средний top-10</th>
+            <th>Разница</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for metric, pair in target_vs_top.items() %}
+            <tr>
+              <td>{{ metric }}</td>
+              <td>{{ pair[0] }}</td>
+              <td>{{ pair[1] }}</td>
+              <td>{{ (pair[0] - pair[1])|round(2) }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>Целевая страница еще не попала в расчет (нет загруженных и оцененных данных).</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>SERP / Intent Summary</h2>
+    {% if serp_summary_data and serp_summary_data.summary %}
+      <p><strong>Источник:</strong> {{ serp_summary_data.source }}</p>
+      <p><strong>dominant_intent:</strong> {{ serp_summary_data.summary.dominant_intent }}</p>
+      <p><strong>dominant_page_type:</strong> {{ serp_summary_data.summary.dominant_page_type }}</p>
+
+      <h3>required_blocks</h3>
+      {% if serp_summary_data.summary.required_blocks %}
+        <ul>
+          {% for item in serp_summary_data.summary.required_blocks %}
+            <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+
+      <h3>common_entities</h3>
+      {% if serp_summary_data.summary.common_entities %}
+        <ul>
+          {% for item in serp_summary_data.summary.common_entities %}
+            <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+
+      <h3>commercial_expectations</h3>
+      {% if serp_summary_data.summary.commercial_expectations %}
+        <ul>
+          {% for item in serp_summary_data.summary.commercial_expectations %}
+            <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+
+      <h3>trust_expectations</h3>
+      {% if serp_summary_data.summary.trust_expectations %}
+        <ul>
+          {% for item in serp_summary_data.summary.trust_expectations %}
+            <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+    {% else %}
+      <p>Summary пока не сформирован.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Gap-анализ</h2>
+
+    <h3>Блоки, которых не хватает</h3>
+    {% if gap_report.missing_blocks %}
+      <ul>
+        {% for item in gap_report.missing_blocks %}
+          <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>Критичных пробелов по структуре не найдено.</p>
+    {% endif %}
+
+    <h3>Недостающие сущности/подтемы</h3>
+    {% if gap_report.missing_entities %}
+      <ul>
+        {% for item in gap_report.missing_entities %}
+          <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>Сильных разрывов по сущностям не найдено.</p>
+    {% endif %}
+
+    <h3>Коммерческие сигналы</h3>
+    {% if gap_report.commercial_gaps %}
+      <ul>
+        {% for item in gap_report.commercial_gaps %}
+          <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>Коммерческие сигналы на приемлемом уровне.</p>
+    {% endif %}
+
+    <h3>Trust-сигналы</h3>
+    {% if gap_report.trust_gaps %}
+      <ul>
+        {% for item in gap_report.trust_gaps %}
+          <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>Trust-сигналы на приемлемом уровне.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Рекомендации</h2>
+    <h3>Срочно исправить</h3>
+    {% if recommendations_by_priority.urgent %}
+      <ul>
+        {% for rec in recommendations_by_priority.urgent %}
+          <li>{{ rec.text }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>Нет критичных рекомендаций.</p>
+    {% endif %}
+
+    <h3>Желательно добавить</h3>
+    {% if recommendations_by_priority.medium %}
+      <ul>
+        {% for rec in recommendations_by_priority.medium %}
+          <li>{{ rec.text }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>Нет рекомендаций среднего приоритета.</p>
+    {% endif %}
+
+    <h3>Можно отложить</h3>
+    {% if recommendations_by_priority.later %}
+      <ul>
+        {% for rec in recommendations_by_priority.later %}
+          <li>{{ rec.text }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>Нет отложенных рекомендаций.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Рекомендации для Codex</h2>
+    <form method="post" action="/runs/{{ run.id }}/rerun-ai-codex">
+      <button type="submit">Запустить AI-анализ и рекомендации для Codex вручную</button>
+    </form>
+    <p class="hint">
+      Полезно, если блок пустой или нужно пересобрать рекомендации после изменения .env и AI-настроек.
+    </p>
+    {% if codex_advice %}
+      <p>{{ codex_advice.summary }}</p>
+      {% if codex_advice.root_cause %}
+        <p><strong>Root cause:</strong> {{ codex_advice.root_cause }}</p>
+      {% endif %}
+
+      <h3>Priority fixes</h3>
+      {% if codex_advice.priority_fixes %}
+        <ul>
+          {% for fix in codex_advice.priority_fixes %}
+            <li>
+              <strong>[{{ fix.priority }}] {{ fix.area }}</strong>:
+              {{ fix.problem }} -> {{ fix.action }} ({{ fix.expected_impact }})
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+
+      <h3>Quick wins</h3>
+      {% if codex_advice.quick_wins %}
+        <ul>
+          {% for item in codex_advice.quick_wins %}
+            <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+
+      <h3>Diagnostics</h3>
+      {% if codex_advice.diagnostics %}
+        <ul>
+          {% for item in codex_advice.diagnostics %}
+            <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+
+      <h3>Content outline</h3>
+      {% if codex_advice.content_outline %}
+        <ul>
+          {% for item in codex_advice.content_outline %}
+            <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+
+      <h3>Copy blocks</h3>
+      {% if codex_advice.copy_blocks %}
+        <ul>
+          {% for item in codex_advice.copy_blocks %}
+            <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+
+      <h3>Промпт для Codex</h3>
+      {% if codex_advice.codex_task_prompt %}
+        <pre>{{ codex_advice.codex_task_prompt }}</pre>
+      {% else %}
+        <p>Нет данных.</p>
+      {% endif %}
+    {% else %}
+      <p>Агент пока не сформировал рекомендации.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Сводка обработки страниц</h2>
+    <p><strong>Скачано страниц:</strong> {{ snapshots|length }}</p>
+    <p><strong>Извлечено наборов признаков:</strong> {{ features_count }}</p>
+    {% if snapshots %}
+      <table class="results-table">
+        <thead>
+          <tr>
+            <th>Тип</th>
+            <th>URL</th>
+            <th>Статус загрузки</th>
+            <th>HTTP</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for snap in snapshots %}
+            <tr>
+              <td>{{ snap.source_type }}</td>
+              <td><a href="{{ snap.source_url }}" target="_blank">{{ snap.source_url }}</a></td>
+              <td>{{ snap.fetch_status }}</td>
+              <td>{{ snap.http_status or "-" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </div>
+
+  <p><a href="/">Запустить новый анализ</a></p>
+{% endblock %}

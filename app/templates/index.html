@@ -1,0 +1,151 @@
+﻿{% extends "base.html" %}
+
+{% block content %}
+  <h1>SEO Ranker MVP</h1>
+  <p class="lead">Запустите анализ: поисковый запрос + целевой URL.</p>
+
+  <form method="post" action="/analyze" class="card js-analyze-form">
+    <label for="query">Поисковая фраза</label>
+    <input id="query" name="query" type="text" required placeholder="купить велосипед" />
+
+    <label for="target_url">Целевой URL</label>
+    <input
+      id="target_url"
+      name="target_url"
+      type="url"
+      required
+      placeholder="https://example.com/page"
+    />
+
+    <label for="manual_top_urls">Ручной top-10 URL (опционально)</label>
+    <textarea
+      id="manual_top_urls"
+      name="manual_top_urls"
+      rows="6"
+      placeholder="https://site1.ru/page\nhttps://site2.ru/page"
+    ></textarea>
+    <p class="hint">
+      Если поле заполнено, анализ пройдет по этим URL и не будет обращаться к Yandex SERP.
+    </p>
+
+    <button type="submit" class="js-submit-btn">Запустить анализ</button>
+
+    <div class="progress-wrap js-progress-wrap" hidden>
+      <div class="progress-head">
+        <strong>Анализ запущен</strong>
+        <span class="js-progress-percent">5%</span>
+      </div>
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="5">
+        <div class="progress-fill js-progress-fill" style="width: 5%;"></div>
+      </div>
+      <p class="hint js-progress-text">Подготавливаем запрос...</p>
+    </div>
+  </form>
+
+  <script>
+    (function () {
+      var form = document.querySelector(".js-analyze-form");
+      if (!form) return;
+
+      var submitBtn = form.querySelector(".js-submit-btn");
+      var progressWrap = form.querySelector(".js-progress-wrap");
+      var progressFill = form.querySelector(".js-progress-fill");
+      var progressPercent = form.querySelector(".js-progress-percent");
+      var progressText = form.querySelector(".js-progress-text");
+      var progressTrack = form.querySelector(".progress-track");
+      var timer = null;
+      var progressValue = 5;
+      var runStatusUrl = null;
+      var runDetailUrl = null;
+
+      function setProgress(value, text) {
+        progressValue = Math.max(0, Math.min(100, value));
+        progressFill.style.width = progressValue + "%";
+        progressPercent.textContent = Math.round(progressValue) + "%";
+        if (progressTrack) {
+          progressTrack.setAttribute("aria-valuenow", String(Math.round(progressValue)));
+        }
+        if (text) {
+          progressText.textContent = text;
+        }
+      }
+
+      function stopPolling() {
+        if (timer) clearInterval(timer);
+      }
+
+      async function pollProgress() {
+        if (!runStatusUrl) return;
+        try {
+          var response = await fetch(runStatusUrl, { method: "GET" });
+          if (!response.ok) throw new Error("HTTP " + response.status);
+
+          var data = await response.json();
+          if (typeof data.percent === "number") {
+            setProgress(data.percent, data.message || "Анализ выполняется...");
+          } else if (data.message) {
+            setProgress(progressValue, data.message);
+          }
+
+          if (data.detail_url) {
+            runDetailUrl = data.detail_url;
+          }
+
+          if (data.is_done) {
+            stopPolling();
+            setProgress(100, data.message || "Готово, открываем результаты...");
+            window.location.href = runDetailUrl || data.detail_url || "/runs/" + data.run_id;
+          }
+        } catch (error) {
+          stopPolling();
+          setProgress(100, "Не удалось получить статус анализа. Открываем страницу запуска...");
+          if (runDetailUrl) {
+            window.location.href = runDetailUrl;
+            return;
+          }
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.textContent = "Запустить анализ";
+          }
+          console.error(error);
+        }
+      }
+
+      form.addEventListener("submit", async function (event) {
+        event.preventDefault();
+        if (submitBtn) {
+          submitBtn.disabled = true;
+          submitBtn.textContent = "Запускаем...";
+        }
+        progressWrap.hidden = false;
+        setProgress(6, "Создаем запуск анализа...");
+
+        try {
+          var response = await fetch("/analyze-start", {
+            method: "POST",
+            body: new FormData(form),
+          });
+
+          if (!response.ok) {
+            throw new Error("HTTP " + response.status);
+          }
+
+          var payload = await response.json();
+          runStatusUrl = payload.status_url;
+          runDetailUrl = payload.detail_url;
+          setProgress(10, "Запуск создан, начинаем сбор данных...");
+          timer = setInterval(pollProgress, 1200);
+          pollProgress();
+        } catch (error) {
+          stopPolling();
+          setProgress(100, "Не удалось запустить анализ. Проверьте поля и попробуйте снова.");
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.textContent = "Запустить анализ";
+          }
+          console.error(error);
+        }
+      });
+    })();
+  </script>
+{% endblock %}
