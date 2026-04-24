@@ -19,7 +19,11 @@ from app.services.gap_analysis import build_basic_gap_recommendations
 from app.services.keyword_parser import parse_keywords
 from app.services.page_fetch import fetch_page_html
 from app.services.scoring import score_page_feature
-from app.services.serp_yandex import fetch_yandex_top10, fetch_yandex_top10_interactive
+from app.services.serp_yandex import (
+    fetch_yandex_top10,
+    fetch_yandex_top10_interactive,
+    fetch_yandex_top10_interactive_batch,
+)
 
 
 def run_analysis_step_serp(db: Session, run: AnalysisRun, keyword_id: int | None = None) -> None:
@@ -163,16 +167,14 @@ def run_analysis_step_serp_interactive(db: Session, run: AnalysisRun, keyword_id
 
     run_dir = Path("artifacts") / "runs" / str(run.id)
     keywords = _load_or_create_keywords(db=db, run=run, keyword_id=keyword_id)
-    pending_keywords = [row for row in keywords if row.status != "done"]
+    pending_keywords = [row for row in keywords if row.status in {"pending", "captcha_detected", "running"}]
     if not pending_keywords:
         pending_keywords = keywords
 
-    collected_keywords = 0
-    failed_keywords = 0
-    total_saved = 0
+    for keyword in pending_keywords:
+        _mark_keyword_running(db=db, keyword=keyword)
 
     for index, keyword in enumerate(pending_keywords, start=1):
-        _mark_keyword_running(db=db, keyword=keyword)
         append_run_log(
             run.id,
             "keyword_start",
@@ -182,30 +184,24 @@ def run_analysis_step_serp_interactive(db: Session, run: AnalysisRun, keyword_id
             keyword_text=keyword.keyword,
             mode="interactive",
         )
-        try:
-            serp_data = fetch_yandex_top10_interactive(query=keyword.keyword, run_dir=run_dir)
-            append_run_log(
-                run.id,
-                "serp.interactive.fetched",
-                keyword_id=keyword.id,
-                keyword_index=index,
-                keyword_count=len(pending_keywords),
-                keyword_text=keyword.keyword,
-                items_count=len(serp_data.items),
-                html_path=serp_data.html_path,
-                screenshot_path=serp_data.screenshot_path,
-                attempts=serp_data.attempts,
-                note=serp_data.note,
-            )
-        except Exception as exc:
-            error_text = _format_exception(exc)
+
+    batch_results = fetch_yandex_top10_interactive_batch(
+        queries=[(keyword.id, keyword.keyword) for keyword in pending_keywords],
+        run_dir=run_dir / "interactive",
+    )
+
+    keyword_map = {keyword.id: keyword for keyword in pending_keywords}
+    total_saved = 0
+    captcha_left = False
+    for index, (keyword_id_result, serp_data, error_text) in enumerate(batch_results, start=1):
+        keyword = keyword_map[keyword_id_result]
+        if error_text:
             lowered = error_text.lower()
             if "captcha" in lowered or "robot" in lowered:
+                captcha_left = True
                 keyword.status = "captcha_detected"
                 keyword.error_message = error_text
-                run.status = "captcha_detected"
-                run.error_message = f"SERP interactive error: {error_text}"
-                db.add_all([keyword, run])
+                db.add(keyword)
                 db.commit()
                 append_run_log(
                     run.id,
@@ -216,21 +212,9 @@ def run_analysis_step_serp_interactive(db: Session, run: AnalysisRun, keyword_id
                     keyword_text=keyword.keyword,
                     mode="interactive",
                     error=error_text,
-                    traceback=traceback.format_exc(),
                 )
-                append_run_log(
-                    run.id,
-                    "serp.interactive.failed",
-                    status=run.status,
-                    error=run.error_message,
-                    keyword_id=keyword.id,
-                    keyword_text=keyword.keyword,
-                    traceback=traceback.format_exc(),
-                )
-                _save_debug_summary(db=db, run=run)
-                return
+                continue
 
-            failed_keywords += 1
             keyword.status = "failed"
             keyword.error_message = error_text
             db.add(keyword)
@@ -244,14 +228,25 @@ def run_analysis_step_serp_interactive(db: Session, run: AnalysisRun, keyword_id
                 keyword_text=keyword.keyword,
                 mode="interactive",
                 error=error_text,
-                traceback=traceback.format_exc(),
             )
             continue
 
+        assert serp_data is not None
+        append_run_log(
+            run.id,
+            "serp.interactive.fetched",
+            keyword_id=keyword.id,
+            keyword_index=index,
+            keyword_count=len(pending_keywords),
+            keyword_text=keyword.keyword,
+            items_count=len(serp_data.items),
+            html_path=serp_data.html_path,
+            screenshot_path=serp_data.screenshot_path,
+            attempts=serp_data.attempts,
+            note=serp_data.note,
+        )
         saved_count = _save_keyword_serp_results(db=db, run=run, keyword=keyword, items=serp_data.items)
         total_saved += saved_count
-        if saved_count > 0:
-            collected_keywords += 1
         keyword.status = "done"
         keyword.error_message = None if saved_count > 0 else f"SERP empty: {serp_data.note or 'unknown_reason'}"
         db.add(keyword)
@@ -278,11 +273,30 @@ def run_analysis_step_serp_interactive(db: Session, run: AnalysisRun, keyword_id
         AnalysisKeyword.run_id == run.id,
         AnalysisKeyword.status == "failed",
     ).count()
+    total_captcha_keywords = db.query(AnalysisKeyword).filter(
+        AnalysisKeyword.run_id == run.id,
+        AnalysisKeyword.status == "captcha_detected",
+    ).count()
+
+    if captcha_left and total_keywords_with_results == 0:
+        run.status = "captcha_detected"
+        run.error_message = "SERP interactive error: captcha still required for one or more keywords"
+        db.add(run)
+        db.commit()
+        append_run_log(
+            run.id,
+            "serp.interactive.failed",
+            status=run.status,
+            error=run.error_message,
+            keywords_captcha=total_captcha_keywords,
+        )
+        _save_debug_summary(db=db, run=run)
+        return
 
     run.status, run.error_message = _build_serp_completion_status(
         collected_keywords=total_keywords_with_results,
-        failed_keywords=total_failed_keywords,
-        empty_keywords=max(0, len(keywords) - total_keywords_with_results - total_failed_keywords),
+        failed_keywords=total_failed_keywords + total_captcha_keywords,
+        empty_keywords=max(0, len(keywords) - total_keywords_with_results - total_failed_keywords - total_captcha_keywords),
         interactive=True,
         manual=False,
     )

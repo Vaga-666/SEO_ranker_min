@@ -191,6 +191,47 @@ def fetch_yandex_top10_interactive(
     raise RuntimeError("Yandex captcha still active after interactive wait timeout")
 
 
+def fetch_yandex_top10_interactive_batch(
+    queries: list[tuple[int, str]],
+    run_dir: Path,
+    manual_wait_sec: int = 240,
+) -> list[tuple[int, SerpFetchResult | None, str | None]]:
+    _ensure_windows_proactor_policy()
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    results: list[tuple[int, SerpFetchResult | None, str | None]] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 2000},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="ru-RU",
+        )
+        page = context.new_page()
+
+        for keyword_id, query in queries:
+            keyword_dir = run_dir / f"keyword_{keyword_id}"
+            try:
+                result = _fetch_yandex_top10_interactive_on_page(
+                    page=page,
+                    query=query,
+                    run_dir=keyword_dir,
+                    manual_wait_sec=manual_wait_sec,
+                )
+                results.append((keyword_id, result, None))
+            except Exception as exc:
+                results.append((keyword_id, None, f"{exc.__class__.__name__}: {str(exc) or repr(exc)}"))
+
+        context.close()
+        browser.close()
+
+    return results
+
+
 def _extract_items_from_dom(page) -> list[SerpItem]:
     items: list[SerpItem] = []
     seen: set[str] = set()
@@ -240,6 +281,67 @@ def _extract_items_from_dom(page) -> list[SerpItem]:
                 )
             )
     return items
+
+
+def _fetch_yandex_top10_interactive_on_page(
+    page,
+    query: str,
+    run_dir: Path,
+    manual_wait_sec: int = 240,
+) -> SerpFetchResult:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    html_path = run_dir / "serp.html"
+    screenshot_path = run_dir / "serp.png"
+
+    search_url = f"https://yandex.ru/search/?text={quote(query)}&p=0"
+    deadline = time.time() + manual_wait_sec
+    last_html = ""
+    attempt = 0
+
+    page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+
+    while time.time() < deadline:
+        attempt += 1
+        page.wait_for_timeout(2500)
+        html = page.content()
+        last_html = html
+        lower_html = html.lower()
+        (run_dir / f"serp_interactive_attempt_{attempt}.html").write_text(html, encoding="utf-8")
+        page.screenshot(path=str(run_dir / f"serp_interactive_attempt_{attempt}.png"), full_page=True)
+
+        if _is_captcha_page(lower_html):
+            continue
+
+        items = _extract_items_from_dom(page)
+        if len(items) < 3:
+            items = _extract_items_from_html(html)
+
+        if items:
+            html_path.write_text(html, encoding="utf-8")
+            page.screenshot(path=str(screenshot_path), full_page=True)
+            return SerpFetchResult(
+                items=items[:10],
+                html_path=str(html_path),
+                screenshot_path=str(screenshot_path),
+                attempts=attempt,
+                note="interactive_success",
+            )
+
+        if _is_no_results_page(lower_html):
+            html_path.write_text(html, encoding="utf-8")
+            page.screenshot(path=str(screenshot_path), full_page=True)
+            return SerpFetchResult(
+                items=[],
+                html_path=str(html_path),
+                screenshot_path=str(screenshot_path),
+                attempts=attempt,
+                note="interactive_no_results_page",
+            )
+
+    if last_html:
+        html_path.write_text(last_html, encoding="utf-8")
+        page.screenshot(path=str(screenshot_path), full_page=True)
+    raise RuntimeError("Yandex captcha still active after interactive wait timeout")
 
 
 def _extract_items_from_html(html: str) -> list[SerpItem]:

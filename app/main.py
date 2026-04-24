@@ -323,6 +323,7 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
         "medium": [r for r in recommendations if r.priority == "medium"],
         "later": [r for r in recommendations if r.priority == "later"],
     }
+    has_captcha_keywords = any(keyword.status == "captcha_detected" for keyword in keywords)
     running_statuses = {
         "created",
         "running",
@@ -373,7 +374,7 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
             "serp_summary_data": serp_summary_data,
             "codex_advice": codex_advice,
             "recommendations_by_priority": recommendations_by_priority,
-            "is_captcha": run.status == "captcha_detected",
+            "is_captcha": run.status == "captcha_detected" or has_captcha_keywords,
             "is_running": is_running,
             "running_seconds": running_seconds,
             "status_hint": status_hints.get(run.status),
