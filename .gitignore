@@ -1,6 +1,35 @@
+# Environments
 .venv/
+venv/
+env/
+
+# Python cache/build
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local data/artifacts
 seo_ranker.db
 artifacts/
+*.log
+
+# Secrets
 .env
+.env.local
+.env.*.local
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo

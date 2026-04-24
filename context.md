@@ -457,3 +457,10 @@
 - Проверка:
   - компиляция модулей успешна;
   - тестовая генерация нового `codex_advice` возвращает заполненные `root_cause`, `codex_task_prompt`, outline и actionable fixes.
+
+## Шаг 27 (2026-04-24)
+- Обновлен `.gitignore`:
+  - добавлены правила для Python-кэша и build-артефактов (`__pycache__`, `*.py[cod]`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `dist`, `build`, `*.egg-info`);
+  - добавлены правила для локальных env/секретов (`.env`, `.env.local`, `.env.*.local`);
+  - сохранено игнорирование локальной БД и артефактов (`seo_ranker.db`, `artifacts/`);
+  - добавлены правила для IDE-файлов (`.idea`, `.vscode`).
