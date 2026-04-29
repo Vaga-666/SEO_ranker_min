@@ -1,18 +1,66 @@
 ﻿{% extends "base.html" %}
 
 {% block content %}
-  <h1>Запуск #{{ run.id }}</h1>
+  <div class="row-actions" style="justify-content: space-between; align-items: center;">
+    <h1 style="margin: 0;">Запуск #{{ run.id }}</h1>
+    <a href="/" class="btn-secondary" style="display: inline-block; text-decoration: none; padding: 10px 14px; border-radius: 8px;">Вернуться на главную</a>
+  </div>
   {% if is_running %}
     <div class="card card-running">
       <h2>Анализ выполняется</h2>
-      <p><strong>Прошло:</strong> {{ running_seconds }} сек</p>
+      <div class="progress-wrap">
+        <div class="progress-head">
+          <strong class="js-run-progress-title">Выполнение</strong>
+          <span class="js-run-progress-percent">0%</span>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="progress-fill js-run-progress-fill" style="width: 0%;"></div>
+        </div>
+        <p class="hint js-run-progress-text">Инициализация...</p>
+      </div>
       {% if status_hint %}
-        <p>{{ status_hint }}</p>
+        <p class="hint">{{ status_hint }}</p>
       {% endif %}
-      <p class="hint">Страница обновляется автоматически каждые 5 секунд.</p>
+      <p class="hint">Статус обновляется автоматически.</p>
     </div>
     <script>
-      setTimeout(function () { window.location.reload(); }, 5000);
+      (function () {
+        var fill = document.querySelector(".js-run-progress-fill");
+        var percentNode = document.querySelector(".js-run-progress-percent");
+        var textNode = document.querySelector(".js-run-progress-text");
+        var track = document.querySelector(".progress-track");
+        var runId = {{ run.id }};
+        var pollUrl = "/runs/" + runId + "/progress";
+        var timer = null;
+
+        function setProgress(value, text) {
+          var v = Math.max(0, Math.min(100, Number(value) || 0));
+          if (fill) fill.style.width = v + "%";
+          if (percentNode) percentNode.textContent = Math.round(v) + "%";
+          if (track) track.setAttribute("aria-valuenow", String(Math.round(v)));
+          if (textNode && text) textNode.textContent = text;
+        }
+
+        async function tick() {
+          try {
+            var resp = await fetch(pollUrl, { method: "GET" });
+            if (!resp.ok) throw new Error("HTTP " + resp.status);
+            var data = await resp.json();
+            setProgress(data.percent, data.message || "Анализ выполняется...");
+            if (data.is_done) {
+              if (timer) clearInterval(timer);
+              setProgress(100, data.message || "Завершено");
+              window.location.reload();
+            }
+          } catch (_e) {
+            if (timer) clearInterval(timer);
+            setProgress(100, "Ошибка получения статуса.");
+          }
+        }
+
+        timer = setInterval(tick, 1500);
+        tick();
+      })();
     </script>
   {% endif %}
 

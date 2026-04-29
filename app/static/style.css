@@ -53,6 +53,16 @@ input {
   font-size: 16px;
 }
 
+select {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 14px;
+  min-width: 320px;
+  max-width: 100%;
+  background: #fff;
+}
+
 textarea {
   width: 100%;
   border: 1px solid var(--border);
@@ -147,4 +157,110 @@ pre {
   width: 0%;
   background: linear-gradient(90deg, #2563eb, #16a34a);
   transition: width 0.35s ease;
+}
+
+.row-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.btn-secondary {
+  background: #e8eefc;
+  color: #12367a;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 18, 40, 0.55);
+  display: grid;
+  place-items: center;
+  z-index: 1000;
+  padding: 16px;
+}
+
+.modal-backdrop[hidden] {
+  display: none !important;
+}
+
+.modal-card {
+  width: min(760px, 100%);
+  max-height: 90vh;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.modal-head h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.btn-close {
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  padding: 0;
+  font-size: 24px;
+  line-height: 1;
+  background: #eef2ff;
+  color: #1e3a8a;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.keyword-picklist {
+  height: 340px;
+  flex: 0 0 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  display: block;
+  background: #fafcff;
+}
+
+.keyword-pick-item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 14px;
+  line-height: 1.35;
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+
+.keyword-pick-item input[type="checkbox"] {
+  width: auto !important;
+  min-width: 16px;
+  max-width: 16px;
+  margin: 0;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.keyword-pick-text {
+  flex: 1 1 auto;
+  word-break: break-word;
 }

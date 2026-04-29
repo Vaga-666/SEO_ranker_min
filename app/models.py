@@ -120,3 +120,15 @@ class Recommendation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     analysis_run: Mapped[AnalysisRun] = relationship(back_populates="recommendations")
+
+
+class KeywordEntry(Base):
+    __tablename__ = "keyword_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    phrase: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    frequency: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    topic: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    target_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), default="wordstat", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

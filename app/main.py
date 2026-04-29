@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 import sys
 import threading
+import uuid
 from datetime import datetime
 
 if __package__ is None or __package__ == "":
@@ -16,13 +17,14 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.db import Base, SessionLocal, engine, get_db
-from app.models import AnalysisRun, PageFeature, PageScore, PageSnapshot, Recommendation, SerpResult
+from app.models import AnalysisRun, KeywordEntry, PageFeature, PageScore, PageSnapshot, Recommendation, SerpResult
 from app.services.pipeline import (
     run_analysis_step_ai_and_recommendations,
     run_analysis_step_serp,
     run_analysis_step_serp_interactive,
     run_analysis_with_manual_serp,
 )
+from app.services.keyword_research import KeywordDiscoveryError, discover_keywords
 
 app = FastAPI(title="SEO Ranker MVP")
 templates = Jinja2Templates(directory="app/templates")
@@ -117,6 +119,87 @@ def start_analysis_json(
             "detail_url": f"/runs/{run.id}",
         }
     )
+
+
+@app.post("/keywords/discover")
+def keywords_discover(
+    target_url: str = Form(""),
+    topic: str = Form(""),
+):
+    target = (target_url or "").strip()
+    topic_clean = (topic or "").strip()
+
+    if not topic_clean and not target:
+        raise HTTPException(status_code=400, detail="Укажите тему вручную или заполните target URL.")
+    if target and not target.startswith("http://") and not target.startswith("https://"):
+        raise HTTPException(status_code=400, detail="target_url must start with http:// or https://")
+
+    try:
+        result = discover_keywords(
+            target_url=target,
+            topic_hint=topic_clean,
+            request_id=uuid.uuid4().hex,
+        )
+    except KeywordDiscoveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@app.post("/keywords/save")
+def keywords_save(
+    keywords_json: str = Form(...),
+    topic: str = Form(""),
+    target_url: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    try:
+        payload = json.loads(keywords_json)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Некорректный JSON в keywords_json.")
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=400, detail="keywords_json должен быть массивом.")
+
+    topic_clean = (topic or "").strip()[:512]
+    target_clean = (target_url or "").strip()[:2048]
+    saved = 0
+    skipped = 0
+
+    for item in payload:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        phrase = str(item.get("phrase") or "").strip()
+        if not phrase:
+            skipped += 1
+            continue
+        count_val = item.get("count")
+        freq = count_val if isinstance(count_val, int) else None
+
+        exists = db.query(KeywordEntry).filter(KeywordEntry.phrase == phrase).first()
+        if exists:
+            if isinstance(freq, int) and (exists.frequency is None or freq > exists.frequency):
+                exists.frequency = freq
+            if topic_clean and not exists.topic:
+                exists.topic = topic_clean
+            if target_clean and not exists.target_url:
+                exists.target_url = target_clean
+            db.add(exists)
+            skipped += 1
+            continue
+
+        db.add(
+            KeywordEntry(
+                phrase=phrase,
+                frequency=freq,
+                topic=topic_clean or None,
+                target_url=target_clean or None,
+                source="wordstat",
+            )
+        )
+        saved += 1
+
+    db.commit()
+    return JSONResponse({"saved": saved, "skipped": skipped})
 
 
 @app.post("/runs/{run_id}/rerun-ai-codex")

@@ -5,8 +5,18 @@
   <p class="lead">Запустите анализ: поисковый запрос + целевой URL.</p>
 
   <form method="post" action="/analyze" class="card js-analyze-form">
-    <label for="query">Поисковая фраза</label>
-    <input id="query" name="query" type="text" required placeholder="купить велосипед" />
+    <label for="query_list">Список поисковых фраз (по одной в строке)</label>
+    <textarea
+      id="query_list"
+      rows="5"
+      placeholder="купить велосипед&#10;велосипед для города&#10;велосипед цена"
+    ></textarea>
+    <div class="row-actions">
+      <select id="active_query" class="js-active-query"></select>
+      <button type="button" class="btn-secondary js-delete-active-query">Удалить выбранную строку</button>
+    </div>
+    <p class="hint">Выбранная фраза будет использована при запуске анализа.</p>
+    <input id="query" name="query" type="hidden" required />
 
     <label for="target_url">Целевой URL</label>
     <input
@@ -16,6 +26,10 @@
       required
       placeholder="https://example.com/page"
     />
+    <div class="row-actions">
+      <button type="button" class="btn-secondary js-open-keyword-modal">Подбор запросов</button>
+      <p class="hint">Подберите популярные запросы через Wordstat и вставьте лучший в поле выше.</p>
+    </div>
 
     <label for="manual_top_urls">Ручной top-10 URL (опционально)</label>
     <textarea
@@ -42,6 +56,46 @@
     </div>
   </form>
 
+  <div class="modal-backdrop js-keyword-modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="keyword-modal-title">
+      <div class="modal-head">
+        <h2 id="keyword-modal-title">Подбор запросов через Wordstat</h2>
+        <button type="button" class="btn-close js-close-keyword-modal" aria-label="Закрыть окно">×</button>
+      </div>
+
+      <p class="hint">
+        Если тема не указана, она будет автоматически определена по target-странице. Далее система
+        сгенерирует seed-запросы, последовательно соберет фразы из Wordstat и заполнит список.
+      </p>
+
+      <label for="keyword_seed">Тема для поиска</label>
+      <input id="keyword_seed" type="text" placeholder="например: онлайн обучение английскому" />
+
+      <div class="row-actions">
+        <button type="button" class="btn-secondary js-discover-keywords">Подобрать запросы автоматически</button>
+        <p class="hint js-keyword-status">Готово к запуску.</p>
+      </div>
+      <div class="progress-wrap js-keyword-progress-wrap" hidden>
+        <div class="progress-head">
+          <strong>Подбор запросов</strong>
+          <span class="js-keyword-progress-percent">0%</span>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="progress-fill js-keyword-progress-fill" style="width: 0%;"></div>
+        </div>
+        <p class="hint js-keyword-progress-text">Ожидание запуска...</p>
+      </div>
+
+      <label>Популярные запросы</label>
+      <div class="keyword-picklist js-keyword-picklist"></div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary js-save-selected-keywords">Добавить отмеченные в базу</button>
+        <button type="button" class="js-close-keyword-modal">Готово</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     (function () {
       var form = document.querySelector(".js-analyze-form");
@@ -57,6 +111,265 @@
       var progressValue = 5;
       var runStatusUrl = null;
       var runDetailUrl = null;
+      var queryInput = form.querySelector("#query");
+      var queryListInput = form.querySelector("#query_list");
+      var activeQuerySelect = form.querySelector(".js-active-query");
+      var deleteActiveQueryBtn = form.querySelector(".js-delete-active-query");
+      var targetInput = form.querySelector("#target_url");
+      var keywordModal = document.querySelector(".js-keyword-modal");
+      var openKeywordModalBtn = form.querySelector(".js-open-keyword-modal");
+      var closeKeywordModalBtns = document.querySelectorAll(".js-close-keyword-modal");
+      var keywordSeedInput = document.querySelector("#keyword_seed");
+      var discoverKeywordsBtn = document.querySelector(".js-discover-keywords");
+      var keywordStatus = document.querySelector(".js-keyword-status");
+      var keywordProgressWrap = document.querySelector(".js-keyword-progress-wrap");
+      var keywordProgressFill = document.querySelector(".js-keyword-progress-fill");
+      var keywordProgressPercent = document.querySelector(".js-keyword-progress-percent");
+      var keywordProgressText = document.querySelector(".js-keyword-progress-text");
+      var keywordPicklist = document.querySelector(".js-keyword-picklist");
+      var saveSelectedKeywordsBtn = document.querySelector(".js-save-selected-keywords");
+      var keywordProgressTimer = null;
+      var keywordProgressValue = 0;
+      var keywordProgressDirection = 1;
+      var keywordRowsState = [];
+      var QUERY_LIST_STORAGE_KEY = "seo_ranker.query_list.v1";
+      var ACTIVE_QUERY_STORAGE_KEY = "seo_ranker.active_query.v1";
+
+      function parseQueryLines(value) {
+        return (value || "")
+          .split(/\r?\n/)
+          .map(function (line) { return line.trim(); })
+          .filter(function (line) { return line.length > 0; });
+      }
+
+      function uniqueLines(lines) {
+        var seen = new Set();
+        var out = [];
+        lines.forEach(function (line) {
+          var key = line.toLowerCase();
+          if (seen.has(key)) return;
+          seen.add(key);
+          out.push(line);
+        });
+        return out;
+      }
+
+      function syncQueryListValue() {
+        if (!queryListInput) return [];
+        var lines = uniqueLines(parseQueryLines(queryListInput.value));
+        queryListInput.value = lines.join("\n");
+        return lines;
+      }
+
+      function renderActiveQuerySelect(preferred) {
+        if (!activeQuerySelect || !queryListInput) return;
+        var lines = syncQueryListValue();
+        activeQuerySelect.innerHTML = "";
+        if (!lines.length) {
+          var emptyOption = document.createElement("option");
+          emptyOption.value = "";
+          emptyOption.textContent = "Нет фраз в списке";
+          activeQuerySelect.appendChild(emptyOption);
+          activeQuerySelect.disabled = true;
+          if (deleteActiveQueryBtn) deleteActiveQueryBtn.disabled = true;
+          return;
+        }
+        activeQuerySelect.disabled = false;
+        if (deleteActiveQueryBtn) deleteActiveQueryBtn.disabled = false;
+        lines.forEach(function (line) {
+          var opt = document.createElement("option");
+          opt.value = line;
+          opt.textContent = line;
+          activeQuerySelect.appendChild(opt);
+        });
+        var stored = localStorage.getItem(ACTIVE_QUERY_STORAGE_KEY) || "";
+        var wanted = preferred || stored || lines[0];
+        if (!lines.some(function (line) { return line === wanted; })) wanted = lines[0];
+        activeQuerySelect.value = wanted;
+      }
+
+      function persistQueryState() {
+        if (!queryListInput) return;
+        localStorage.setItem(QUERY_LIST_STORAGE_KEY, queryListInput.value || "");
+        if (activeQuerySelect) {
+          localStorage.setItem(ACTIVE_QUERY_STORAGE_KEY, activeQuerySelect.value || "");
+        }
+      }
+
+      function closeKeywordModal() {
+        if (!keywordModal) return;
+        keywordModal.hidden = true;
+      }
+
+      function openKeywordModal() {
+        if (!keywordModal) return;
+        keywordModal.hidden = false;
+        if (queryListInput && queryListInput.value && keywordSeedInput && !keywordSeedInput.value) {
+          var firstQuery = (queryListInput.value || "")
+            .split(/\r?\n/)
+            .map(function (line) { return line.trim(); })
+            .find(function (line) { return line.length > 0; });
+          if (firstQuery) keywordSeedInput.value = firstQuery;
+        }
+      }
+
+      function setKeywordStatus(text) {
+        if (keywordStatus) keywordStatus.textContent = text;
+      }
+
+      function normalizeKeywordRows(payload) {
+        var rows = Array.isArray(payload.keywords_with_counts) ? payload.keywords_with_counts : [];
+        if (rows.length) {
+          return rows
+            .map(function (item) {
+              var phrase = (item && item.phrase) ? String(item.phrase).trim() : "";
+              if (!phrase) return null;
+              var count = (item && typeof item.count === "number") ? item.count : null;
+              return { phrase: phrase, count: count };
+            })
+            .filter(function (x) { return !!x; });
+        }
+        var plain = Array.isArray(payload.keywords) ? payload.keywords : [];
+        return plain
+          .map(function (line) {
+            var s = String(line || "").trim();
+            if (!s) return null;
+            var parts = s.split("—");
+            var phrase = String(parts[0] || "").trim();
+            var count = null;
+            if (parts.length > 1) {
+              var raw = String(parts[1] || "").replace(/\s/g, "");
+              if (/^\d+$/.test(raw)) count = Number(raw);
+            }
+            return phrase ? { phrase: phrase, count: count } : null;
+          })
+          .filter(function (x) { return !!x; });
+      }
+
+      function renderKeywordPicklist(rows) {
+        if (!keywordPicklist) return;
+        keywordPicklist.innerHTML = "";
+        if (!rows || !rows.length) return;
+        var frag = document.createDocumentFragment();
+        rows.forEach(function (row, idx) {
+          var line = document.createElement("label");
+          line.className = "keyword-pick-item";
+
+          var cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.checked = false;
+          cb.dataset.idx = String(idx);
+          cb.id = "kw_pick_" + idx;
+
+          var txt = document.createElement("span");
+          txt.className = "keyword-pick-text";
+          txt.textContent = row.phrase + " — " + (typeof row.count === "number" ? String(row.count) : "n/a");
+
+          line.appendChild(cb);
+          line.appendChild(txt);
+          frag.appendChild(line);
+        });
+        keywordPicklist.appendChild(frag);
+      }
+
+      function setKeywordProgress(value, text) {
+        keywordProgressValue = Math.max(0, Math.min(100, value));
+        if (keywordProgressFill) keywordProgressFill.style.width = keywordProgressValue + "%";
+        if (keywordProgressPercent) keywordProgressPercent.textContent = Math.round(keywordProgressValue) + "%";
+        if (keywordProgressText && text) keywordProgressText.textContent = text;
+      }
+
+      function stopKeywordProgressPump() {
+        if (keywordProgressTimer) {
+          clearInterval(keywordProgressTimer);
+          keywordProgressTimer = null;
+        }
+      }
+
+      async function discoverKeywords() {
+        if (!discoverKeywordsBtn) return;
+        var targetUrl = (targetInput.value || "").trim();
+        var manualTopic = (keywordSeedInput && keywordSeedInput.value ? keywordSeedInput.value : "").trim();
+        if (!manualTopic && !targetUrl) {
+          setKeywordStatus("Укажите тему вручную или заполните целевой URL.");
+          return;
+        }
+        discoverKeywordsBtn.disabled = true;
+        if (keywordProgressWrap) keywordProgressWrap.hidden = false;
+        stopKeywordProgressPump();
+        setKeywordProgress(8, manualTopic ? "Стартуем подбор по указанной теме..." : "Парсим target и определяем тему...");
+        keywordProgressTimer = setInterval(function () {
+          if (keywordProgressValue < 90) {
+            var step = keywordProgressValue < 35 ? 4 : (keywordProgressValue < 70 ? 2 : 1);
+            setKeywordProgress(keywordProgressValue + step, keywordProgressText ? keywordProgressText.textContent : "");
+            return;
+          }
+          // Keep progress alive while backend performs iterative cycles.
+          var next = keywordProgressValue + keywordProgressDirection;
+          if (next >= 98) {
+            next = 98;
+            keywordProgressDirection = -1;
+          } else if (next <= 92) {
+            next = 92;
+            keywordProgressDirection = 1;
+          }
+          setKeywordProgress(next, "Выполняются циклы подбора запросов...");
+        }, 450);
+        setKeywordStatus("Собираем тему, генерируем seed-запросы и обходим Wordstat...");
+        try {
+          var formData = new FormData();
+          formData.append("target_url", targetUrl);
+          formData.append("topic", manualTopic);
+          var response = await fetch("/keywords/discover", {
+            method: "POST",
+            body: formData,
+          });
+          if (!response.ok) {
+            var errorPayload = {};
+            try {
+              errorPayload = await response.json();
+            } catch (_e) {}
+            var msg = (errorPayload && errorPayload.detail) ? errorPayload.detail : ("HTTP " + response.status);
+            throw new Error(msg);
+          }
+          var payload = await response.json();
+          if (payload.log_file) {
+            console.log("Keyword discovery log:", payload.log_file);
+          }
+          if (keywordSeedInput && payload.topic) {
+            keywordSeedInput.value = payload.topic;
+          }
+          setKeywordProgress(95, "Обрабатываем и сортируем итоговый список...");
+          keywordRowsState = normalizeKeywordRows(payload);
+          var keywords = keywordRowsState.map(function (row) {
+            return row.phrase + " — " + (typeof row.count === "number" ? String(row.count) : "n/a");
+          });
+          renderKeywordPicklist(keywordRowsState);
+          var d = payload.diagnostics || {};
+          if (!keywords.length) {
+            setKeywordStatus(
+              "Wordstat не вернул фразы. Попыток: " + (d.wordstat_attempts || 0) +
+              ", успешных: " + (d.wordstat_successes || 0) + "."
+            );
+          } else {
+            var hasNa = keywords.some(function (line) { return /—\s*n\/a$/i.test(line); });
+            setKeywordStatus(
+              "Готово: найдено " + keywords.length + " запросов. " +
+              "Wordstat успешных проходов: " + (d.wordstat_successes || 0) + "/" + (d.wordstat_attempts || 0) + "." +
+              (payload.log_file ? " Лог: " + payload.log_file : "") +
+              (hasNa ? " Для части фраз частоты не извлечены из ответа Wordstat." : "")
+            );
+          }
+          setKeywordProgress(100, "Подбор завершен.");
+        } catch (error) {
+          console.error(error);
+          setKeywordProgress(100, "Подбор завершен с ошибкой.");
+          setKeywordStatus("Ошибка: " + (error && error.message ? error.message : "не удалось подобрать запросы."));
+        } finally {
+          stopKeywordProgressPump();
+          discoverKeywordsBtn.disabled = false;
+        }
+      }
 
       function setProgress(value, text) {
         progressValue = Math.max(0, Math.min(100, value));
@@ -111,8 +424,117 @@
         }
       }
 
+      if (openKeywordModalBtn) {
+        openKeywordModalBtn.addEventListener("click", openKeywordModal);
+      }
+
+      closeKeywordModalBtns.forEach(function (btn) {
+        btn.addEventListener("click", closeKeywordModal);
+      });
+
+      if (keywordModal) {
+        keywordModal.addEventListener("click", function (event) {
+          if (event.target === keywordModal) closeKeywordModal();
+        });
+      }
+
+      if (discoverKeywordsBtn) {
+        discoverKeywordsBtn.addEventListener("click", discoverKeywords);
+      }
+
+      if (saveSelectedKeywordsBtn) {
+        saveSelectedKeywordsBtn.addEventListener("click", async function () {
+          if (!keywordPicklist) return;
+          var selected = Array.from(keywordPicklist.querySelectorAll("input[type='checkbox']:checked"))
+            .map(function (cb) { return Number(cb.dataset.idx); })
+            .filter(function (idx) { return Number.isInteger(idx) && idx >= 0 && idx < keywordRowsState.length; })
+            .map(function (idx) { return keywordRowsState[idx]; });
+          if (!selected.length) {
+            setKeywordStatus("Отметьте запросы для сохранения.");
+            return;
+          }
+          if (queryListInput) {
+            var existing = new Set(syncQueryListValue().map(function (line) { return line.toLowerCase(); }));
+            var appended = [];
+            selected.forEach(function (row) {
+              var phrase = String((row && row.phrase) || "").trim();
+              if (!phrase) return;
+              var key = phrase.toLowerCase();
+              if (existing.has(key)) return;
+              existing.add(key);
+              appended.push(phrase);
+            });
+            if (appended.length) {
+              var merged = syncQueryListValue().concat(appended);
+              queryListInput.value = uniqueLines(merged).join("\n");
+              renderActiveQuerySelect(appended[0]);
+              persistQueryState();
+            }
+          }
+          saveSelectedKeywordsBtn.disabled = true;
+          try {
+            var formData = new FormData();
+            formData.append("keywords_json", JSON.stringify(selected));
+            formData.append("topic", keywordSeedInput ? (keywordSeedInput.value || "").trim() : "");
+            formData.append("target_url", targetInput ? (targetInput.value || "").trim() : "");
+            var resp = await fetch("/keywords/save", { method: "POST", body: formData });
+            if (!resp.ok) {
+              var ep = {};
+              try { ep = await resp.json(); } catch (_e) {}
+              throw new Error(ep.detail || ("HTTP " + resp.status));
+            }
+            var data = await resp.json();
+            setKeywordStatus("Сохранено в базу: " + (data.saved || 0) + ", пропущено: " + (data.skipped || 0) + ".");
+          } catch (e) {
+            setKeywordStatus("Ошибка сохранения: " + (e && e.message ? e.message : "неизвестная ошибка"));
+          } finally {
+            saveSelectedKeywordsBtn.disabled = false;
+          }
+        });
+      }
+
+      if (queryListInput) {
+        var storedList = localStorage.getItem(QUERY_LIST_STORAGE_KEY);
+        if (storedList && !queryListInput.value) {
+          queryListInput.value = storedList;
+        }
+        queryListInput.addEventListener("input", function () {
+          renderActiveQuerySelect();
+          persistQueryState();
+        });
+      }
+
+      if (activeQuerySelect) {
+        activeQuerySelect.addEventListener("change", persistQueryState);
+      }
+
+      if (deleteActiveQueryBtn) {
+        deleteActiveQueryBtn.addEventListener("click", function () {
+          if (!queryListInput || !activeQuerySelect) return;
+          var selectedValue = (activeQuerySelect.value || "").trim();
+          if (!selectedValue) return;
+          var lines = syncQueryListValue().filter(function (line) {
+            return line !== selectedValue;
+          });
+          queryListInput.value = lines.join("\n");
+          renderActiveQuerySelect(lines[0] || "");
+          persistQueryState();
+        });
+      }
+
+      renderActiveQuerySelect();
+
       form.addEventListener("submit", async function (event) {
         event.preventDefault();
+        var selectedQuery = activeQuerySelect ? (activeQuerySelect.value || "").trim() : "";
+        var fallbackQuery = queryListInput ? (syncQueryListValue()[0] || "") : "";
+        var queryToRun = selectedQuery || fallbackQuery;
+        if (!queryToRun) {
+          setProgress(100, "Укажите хотя бы одну поисковую фразу.");
+          return;
+        }
+        if (queryInput) queryInput.value = queryToRun;
+        persistQueryState();
         if (submitBtn) {
           submitBtn.disabled = true;
           submitBtn.textContent = "Запускаем...";
