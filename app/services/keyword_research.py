@@ -3,6 +3,7 @@ import json
 import random
 import re
 import sys
+import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -16,11 +17,14 @@ from openai import OpenAI
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from app.config import get_settings
+from app.config import ROOT_DIR, get_settings
 
 
 class KeywordDiscoveryError(Exception):
     pass
+
+
+_WORDSTAT_LOCK = threading.Lock()
 
 
 class KeywordDiscoveryLogger:
@@ -94,6 +98,8 @@ def discover_keywords(
             logger=logger,
         )
         if not seed:
+            seed = _fallback_seed_query(topic=topic, previous_seeds=previous_seeds, logger=logger)
+        if not seed:
             logger.log("loop.stop", reason="ai_empty_next_seed", iteration=index)
             break
 
@@ -103,7 +109,12 @@ def discover_keywords(
 
         logger.log("cycle.start", index=index, seed=seed)
         t0 = time.perf_counter()
-        parsed_items, fetch_meta = _fetch_wordstat_items(seed_query=seed, logger=logger)
+        if not _WORDSTAT_LOCK.acquire(blocking=False):
+            raise KeywordDiscoveryError("Wordstat уже запущен в другом окне. Дождитесь завершения текущего подбора и попробуйте снова.")
+        try:
+            parsed_items, fetch_meta = _fetch_wordstat_items(seed_query=seed, logger=logger)
+        finally:
+            _WORDSTAT_LOCK.release()
         if fetch_meta.get("auth_required"):
             diagnostics["auth_required_detected"] = True
         if fetch_meta.get("captcha"):
@@ -353,6 +364,18 @@ def _generate_next_seed_query(
         return ""
 
 
+def _fallback_seed_query(topic: str, previous_seeds: list[str], logger: KeywordDiscoveryLogger) -> str:
+    seed = re.sub(r"\s+", " ", (topic or "").strip())
+    if not seed:
+        logger.log("seed.fallback.skip", reason="empty_topic")
+        return ""
+    if seed in previous_seeds:
+        logger.log("seed.fallback.skip", reason="duplicate_topic", seed=seed)
+        return ""
+    logger.log("seed.fallback.topic", seed=seed)
+    return seed
+
+
 def _fetch_wordstat_items(seed_query: str, logger: KeywordDiscoveryLogger) -> tuple[list[dict[str, Any]], dict[str, bool]]:
     _ensure_windows_proactor_policy()
     url = f"https://wordstat.yandex.ru/?words={quote_plus(seed_query)}"
@@ -361,8 +384,9 @@ def _fetch_wordstat_items(seed_query: str, logger: KeywordDiscoveryLogger) -> tu
     page_title = ""
     network_items: list[dict[str, Any]] = []
     meta = {"auth_required": False, "captcha": False}
-    profile_dir = Path("artifacts") / "playwright_wordstat_profile"
+    profile_dir = (ROOT_DIR / "artifacts" / "playwright_wordstat_profile").resolve()
     profile_dir.mkdir(parents=True, exist_ok=True)
+    logger.log("wordstat.profile", path=str(profile_dir))
 
     def run_session(headless: bool, manual_login_wait: bool) -> tuple[str, str, str, list[dict[str, Any]]]:
         local_html = ""
@@ -390,26 +414,6 @@ def _fetch_wordstat_items(seed_query: str, logger: KeywordDiscoveryLogger) -> tu
             )
             page = context.new_page()
 
-            def _on_response(resp):
-                try:
-                    ctype = (resp.headers.get("content-type") or "").lower()
-                    if "json" not in ctype:
-                        return
-                    body = resp.text()
-                    parsed = json.loads(body)
-                    extracted: list[dict[str, Any]] = []
-                    if "/wordstat/api/search" in resp.url:
-                        extracted = _extract_wordstat_search_table(parsed)
-                    if not extracted:
-                        if not any(k in body for k in ['"shows"', '"phrase"', '"text"', '"requests"', '"freq"', '"words"', '"value"']):
-                            return
-                        extracted = _extract_phrase_counts_from_json(parsed)
-                    if extracted:
-                        local_items.extend(extracted)
-                except Exception:
-                    return
-
-            page.on("response", _on_response)
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
             if manual_login_wait:
                 deadline = time.time() + 240
@@ -417,9 +421,16 @@ def _fetch_wordstat_items(seed_query: str, logger: KeywordDiscoveryLogger) -> tu
                 logger.log("wordstat.manual_login.wait_start", timeout_sec=240)
                 while time.time() < deadline:
                     attempt += 1
+                    if page.is_closed():
+                        logger.log("wordstat.manual_login.closed", attempts=attempt)
+                        break
                     _ensure_login_form_visible(page)
-                    page.wait_for_timeout(2500)
-                    cur_url = page.url.lower()
+                    try:
+                        page.wait_for_timeout(2500)
+                        cur_url = page.url.lower()
+                    except Exception as exc:
+                        logger.log("wordstat.manual_login.closed", attempts=attempt, error=f"{exc.__class__.__name__}: {str(exc) or repr(exc)}")
+                        break
                     if "passport.yandex" in cur_url or "id.yandex" in cur_url:
                         continue
                     try:
@@ -434,19 +445,39 @@ def _fetch_wordstat_items(seed_query: str, logger: KeywordDiscoveryLogger) -> tu
                 else:
                     logger.log("wordstat.manual_login.timeout")
             try:
-                page.wait_for_timeout(2200)
-                page.wait_for_load_state("networkidle", timeout=3500)
+                if not page.is_closed():
+                    try:
+                        page.wait_for_function(
+                            """
+                            () => {
+                              const text = document.body ? document.body.innerText : "";
+                              return text.includes("Phrasing") ||
+                                text.includes("Number of") ||
+                                text.includes("No impression data") ||
+                                text.includes("Нет данных");
+                            }
+                            """,
+                            timeout=12000,
+                        )
+                    except PlaywrightTimeoutError:
+                        logger.log("wordstat.open.results_timeout", seed=seed_query, url=url, headless=headless)
+                    page.wait_for_timeout(2200)
+                    page.wait_for_load_state("networkidle", timeout=3500)
             except PlaywrightTimeoutError:
                 logger.log("wordstat.open.networkidle_timeout", seed=seed_query, url=url, headless=headless)
-            local_final_url = page.url
-            local_title = page.title()
-            local_html = page.content()
-            context.close()
+            if not page.is_closed():
+                local_final_url = page.url
+                local_title = page.title()
+                local_html = page.content()
+            try:
+                context.close()
+            except Exception:
+                pass
         return local_html, local_final_url, local_title, local_items
 
     try:
-        logger.log("wordstat.open.start", seed=seed_query, url=url, headless=True)
-        html, final_url, page_title, network_items = run_session(headless=True, manual_login_wait=False)
+        logger.log("wordstat.open.start", seed=seed_query, url=url, headless=False)
+        html, final_url, page_title, network_items = run_session(headless=False, manual_login_wait=False)
         logger.log("wordstat.open.ok", seed=seed_query, url=url, final_url=final_url, title=page_title, html_len=len(html))
     except Exception as exc:
         logger.log("wordstat.open.error", seed=seed_query, url=url, error=f"{exc.__class__.__name__}: {str(exc) or repr(exc)}")
@@ -503,6 +534,41 @@ def _fetch_wordstat_items(seed_query: str, logger: KeywordDiscoveryLogger) -> tu
                 seed=seed_query,
                 error=f"{exc.__class__.__name__}: {str(exc) or repr(exc)}",
             )
+            try:
+                logger.log("wordstat.open.after_manual_close.start", seed=seed_query, url=url)
+                html, final_url, page_title, second_network_items = run_session(headless=False, manual_login_wait=False)
+                if second_network_items:
+                    network_items.extend(second_network_items)
+                logger.log(
+                    "wordstat.open.after_manual_close.done",
+                    seed=seed_query,
+                    final_url=final_url,
+                    title=page_title,
+                    html_len=len(html),
+                )
+                meta["auth_required"] = False
+            except Exception as second_exc:
+                logger.log(
+                    "wordstat.open.after_manual_close.error",
+                    seed=seed_query,
+                    error=f"{second_exc.__class__.__name__}: {str(second_exc) or repr(second_exc)}",
+                )
+                return [], meta
+
+        if network_items:
+            deduped_network = _dedupe_items(network_items)
+            logger.log("wordstat.network.items_after_login", seed=seed_query, count=len(deduped_network))
+            if deduped_network:
+                return deduped_network, meta
+
+        soup = BeautifulSoup(html, "lxml")
+        page_text = soup.get_text(" ", strip=True).lower()
+        title_text = (soup.title.get_text(" ", strip=True).lower() if soup.title else "")
+        html_low = html.lower()
+        final_url_low = final_url.lower()
+        if "passport.yandex" in final_url_low or "id.yandex" in final_url_low:
+            logger.log("wordstat.parse.auth_required_after_login", seed=seed_query, final_url=final_url, title=title_text[:120])
+            meta["auth_required"] = True
             return [], meta
 
     items: list[dict[str, Any]] = []
@@ -526,9 +592,81 @@ def _fetch_wordstat_items(seed_query: str, logger: KeywordDiscoveryLogger) -> tu
             break
 
     if len(items) < 5:
+        text_items = _extract_wordstat_items_from_text(soup.get_text("\n", strip=True))
+        if text_items:
+            logger.log("wordstat.parse.text_hit", seed=seed_query, count=len(text_items))
+            items.extend(text_items)
+
+    if len(items) < 5:
         logger.log("wordstat.parse.low_count", seed=seed_query, count=len(items), final_url=final_url, title=title_text[:120])
 
     return _dedupe_items(items), meta
+
+
+def _extract_wordstat_items_from_text(text: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    started = False
+    pending_phrase = ""
+    stop_markers = (
+        "if using materials from this page",
+        "yandex",
+        "help",
+        "user agreement",
+        "interface tour",
+        "api",
+        "regions",
+        "previous selection",
+    )
+    header_markers = {
+        "phrasing",
+        "number of",
+        "queries",
+        "popular",
+        "similar",
+        "top queries",
+        "dynamics",
+        "regions",
+        "sites by query",
+    }
+
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line.replace("\xa0", " ")).strip()
+        if not line:
+            continue
+        low = line.lower()
+        if "phrasing" in low:
+            started = True
+            continue
+        if not started:
+            continue
+        if any(low.startswith(marker) for marker in stop_markers):
+            break
+        if low in header_markers:
+            continue
+
+        if pending_phrase and re.fullmatch(r"\d[\d\s]{0,15}", line):
+            phrase = pending_phrase
+            count = _parse_int(line)
+            pending_phrase = ""
+        else:
+            match = re.match(r"^(.+?)\s+(\d[\d\s]{0,15})$", line)
+            if match:
+                phrase = match.group(1).strip()
+                count = _parse_int(match.group(2))
+            else:
+                if _valid_phrase(line) and not _looks_like_month_or_region_row(line):
+                    pending_phrase = line
+                continue
+        if not _valid_phrase(phrase) or not isinstance(count, int):
+            continue
+        if _looks_like_month_or_region_row(phrase):
+            continue
+        items.append({"phrase": phrase, "count": count, "source": "wordstat_text"})
+        pending_phrase = ""
+
+    return _dedupe_items(items)
+
+
 def _extract_phrase_counts_from_json(payload: Any) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
 

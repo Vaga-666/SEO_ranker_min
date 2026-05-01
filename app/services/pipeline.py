@@ -17,8 +17,14 @@ from app.services.debug_io import append_run_log, save_run_json
 from app.services.feature_extractor import extract_page_features
 from app.services.gap_analysis import build_basic_gap_recommendations
 from app.services.page_fetch import fetch_page_html
-from app.services.scoring import score_page_feature
+from app.services.scoring import score_page_feature, score_page_feature_debug
 from app.services.serp_yandex import fetch_yandex_top10, fetch_yandex_top10_interactive
+from app.services.target_debug import (
+    build_target_html_debug,
+    feature_debug_dict,
+    log_payload_fields,
+    score_debug_dict,
+)
 
 
 def run_analysis_step_serp(db: Session, run: AnalysisRun) -> None:
@@ -231,6 +237,7 @@ def run_analysis_step_pages(db: Session, run: AnalysisRun, run_dir: Path) -> Non
             fetch_status=fetch_result.fetch_status,
             http_status=fetch_result.http_status,
             raw_html_path=fetch_result.raw_html_path,
+            fetch_method=fetch_result.fetch_method,
             error=fetch_result.error_message,
         )
 
@@ -254,6 +261,15 @@ def run_analysis_step_pages(db: Session, run: AnalysisRun, run_dir: Path) -> Non
         try:
             html = Path(fetch_result.raw_html_path).read_text(encoding="utf-8", errors="ignore")
             features = extract_page_features(html=html, page_url=url)
+            if source_type == "target":
+                target_debug = build_target_html_debug(
+                    target_url=url,
+                    fetch_method=fetch_result.fetch_method,
+                    html=html,
+                    extracted_features=feature_debug_dict(features),
+                )
+                append_run_log(run.id, "target.html_debug", **log_payload_fields(target_debug))
+                save_run_json(run.id, "target_feature_debug.json", target_debug)
             db.add(
                 PageFeature(
                     analysis_run_id=run.id,
@@ -320,6 +336,7 @@ def run_analysis_step_scoring(db: Session, run: AnalysisRun, had_errors: bool = 
     scores: list[PageScore] = []
     for feature in features:
         score = score_page_feature(query=run.query, feature=feature)
+        score_debug = score_page_feature_debug(query=run.query, feature=feature)
         score_row = PageScore(
             analysis_run_id=run.id,
             source_url=feature.source_url,
@@ -340,6 +357,8 @@ def run_analysis_step_scoring(db: Session, run: AnalysisRun, had_errors: bool = 
             source_type=feature.source_type,
             total_score=score.total_score,
         )
+        if feature.source_type == "target":
+            _save_target_feature_debug(db=db, run=run, feature=feature, score=score, score_reasons=score_debug.reasons)
 
     db.flush()
 
@@ -359,6 +378,49 @@ def run_analysis_step_scoring(db: Session, run: AnalysisRun, had_errors: bool = 
     append_run_log(run.id, "scoring.done", status=run.status, scored_count=len(scores), had_errors=had_errors)
     _save_debug_summary(db=db, run=run)
     run_analysis_step_ai_and_recommendations(db=db, run=run, had_errors=had_errors)
+
+
+def _save_target_feature_debug(
+    *,
+    db: Session,
+    run: AnalysisRun,
+    feature: PageFeature,
+    score: Any,
+    score_reasons: dict[str, Any],
+) -> None:
+    snapshot = (
+        db.query(PageSnapshot)
+        .filter(PageSnapshot.analysis_run_id == run.id, PageSnapshot.source_type == "target")
+        .order_by(PageSnapshot.id.desc())
+        .first()
+    )
+    html = ""
+    html_path = snapshot.raw_html_path if snapshot else None
+    if html_path:
+        try:
+            html = Path(html_path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            html = ""
+    payload = build_target_html_debug(
+        target_url=feature.source_url,
+        fetch_method=_infer_fetch_method(snapshot),
+        html=html,
+        extracted_features=feature_debug_dict(feature),
+        calculated_scores=score_debug_dict(score),
+        score_reasons=score_reasons,
+    )
+    append_run_log(run.id, "target.feature_debug_saved", **log_payload_fields(payload))
+    save_run_json(run.id, "target_feature_debug.json", payload)
+
+
+def _infer_fetch_method(snapshot: PageSnapshot | None) -> str:
+    if snapshot is None or not snapshot.raw_html_path:
+        return "unknown"
+    try:
+        html = Path(snapshot.raw_html_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return "unknown"
+    return "playwright_rendered" if "data-seo-ranker-rendered" in html else "httpx"
 
 
 def run_analysis_step_ai_and_recommendations(db: Session, run: AnalysisRun, had_errors: bool = False) -> None:

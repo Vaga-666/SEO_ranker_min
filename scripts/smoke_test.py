@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services.feature_extractor import extract_page_features
-from app.services.scoring import score_page_feature
+from app.services.scoring import score_page_feature, score_page_feature_debug
 
 
 class _DummyFeature:
@@ -21,7 +21,9 @@ class _DummyFeature:
         self.has_lists = extracted.has_lists
         self.has_cta = extracted.has_cta
         self.has_forms = extracted.has_forms
+        self.has_lead_form = extracted.has_lead_form
         self.has_prices = extracted.has_prices
+        self.has_courses = extracted.has_courses
         self.has_reviews = extracted.has_reviews
         self.has_contacts = extracted.has_contacts
         self.internal_links_count = extracted.internal_links_count
@@ -33,27 +35,93 @@ def main() -> None:
     html = """
     <html>
       <head>
-        <title>Купить велосипед в Москве</title>
-        <meta name="description" content="Велосипеды, цены, доставка, отзывы">
+        <title>ABI studio - онлайн-школа с ИИ и практическими заданиями</title>
+        <meta name="description" content="Онлайн-курсы, практические задания, AI Экзаменатор, отзывы, контакты и бесплатный старт">
+        <script type="application/ld+json">
+          {
+            "@context": "https://schema.org",
+            "@graph": [
+              {"@type": "Organization", "name": "ABI studio", "email": "support@bots-ai.net"},
+              {"@type": "WebPage", "name": "Онлайн-школа ABI studio"},
+              {
+                "@type": "FAQPage",
+                "mainEntity": [
+                  {
+                    "@type": "Question",
+                    "name": "Можно ли начать бесплатно?",
+                    "acceptedAnswer": {"@type": "Answer", "text": "Да, можно выбрать бесплатный старт."}
+                  }
+                ]
+              }
+            ]
+          }
+        </script>
       </head>
       <body>
-        <h1>Купить велосипед</h1>
-        <h2>Каталог</h2>
-        <h3>Доставка</h3>
-        <p>Цена от 25000 ₽. Оставить заявку и получить консультацию.</p>
-        <form><input type="text" /></form>
-        <ul><li>Отзывы</li></ul>
-        <a href="/contacts">Контакты</a>
-        <a href="https://maps.example.org">Карта</a>
+        <h1>Онлайн-школа с ИИ, практическими заданиями и AI-тренажером</h1>
+        <h2>Курсы и форматы обучения</h2>
+        <ul>
+          <li>Бесплатные курсы</li>
+          <li>Платные практические курсы</li>
+          <li>Курс Python онлайн</li>
+          <li>SQL и обучение программированию</li>
+        </ul>
+        <a href="#courses">Смотреть курсы</a>
+        <button>Начать бесплатно</button>
+        <a href="mailto:support@bots-ai.net">Задать вопрос</a>
+
+        <section>
+          <h2>Нужна помощь с выбором курса?</h2>
+          <form action="mailto:support@bots-ai.net" method="post" enctype="text/plain">
+            <label>Ваше имя<input name="name" placeholder="Ваше имя" /></label>
+            <label>Контакт<input name="contact" placeholder="Email или Telegram" /></label>
+            <label>Сообщение<textarea name="message" placeholder="Какой курс или формат обучения вас интересует?"></textarea></label>
+            <button type="submit">Отправить заявку</button>
+          </form>
+        </section>
+
+        <section>
+          <h2>Вопрос-ответ</h2>
+          <h3>Что такое ABI studio?</h3>
+          <p>Это образовательная платформа и онлайн обучение через практические задания.</p>
+          <h3>Можно ли начать бесплатно?</h3>
+          <p>Да, можно открыть бесплатные курсы и затем купить платные форматы обучения.</p>
+        </section>
+
+        <section>
+          <h2>Отзывы и результаты</h2>
+          <p>Ученик, студент, пользователь и преподаватель делятся учебными результатами и кейсами.</p>
+        </section>
+
+        <section>
+          <h2>Контакты</h2>
+          <p>Email: support@bots-ai.net</p>
+          <p>Сайт и формат работы: онлайн.</p>
+        </section>
       </body>
     </html>
     """
-    extracted = extract_page_features(html=html, page_url="https://example.com/bikes")
+    extracted = extract_page_features(html=html, page_url="https://example.com/")
     feature = _DummyFeature(extracted)
-    score = score_page_feature(query="купить велосипед", feature=feature)
+    score = score_page_feature(query="онлайн школа", feature=feature)
+    debug = score_page_feature_debug(query="онлайн школа", feature=feature)
 
     assert score.total_score > 0
-    assert score.intent_fit >= 50
+    assert extracted.has_cta is True
+    assert extracted.has_forms is True
+    assert extracted.has_lead_form is True
+    assert extracted.has_reviews is True
+    assert extracted.has_contacts is True
+    assert extracted.has_faq is True
+    assert extracted.has_schema_org is True
+    assert extracted.has_courses is True
+    assert score.structure_fit > 0
+    assert score.commercial_fit > 0
+    assert score.trust_fit > 0
+    assert debug.reasons["structure_fit"]["passed_rules"]
+    assert debug.reasons["commercial_fit"]["passed_rules"]
+    assert debug.reasons["trust_fit"]["passed_rules"]
+
     print("smoke_test: OK")
     print(
         {

@@ -312,6 +312,7 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     )
     serp_summary_data = _read_serp_summary(run.id)
     codex_advice = _read_codex_advice(run.id)
+    target_feature_debug = _read_target_feature_debug(run.id)
 
     recommendations_by_priority = {
         "urgent": [r for r in recommendations if r.priority == "urgent"],
@@ -359,6 +360,7 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
             "gap_report": gap_report,
             "serp_summary_data": serp_summary_data,
             "codex_advice": codex_advice,
+            "target_feature_debug": target_feature_debug,
             "recommendations_by_priority": recommendations_by_priority,
             "is_captcha": run.status == "captcha_detected",
             "is_running": is_running,
@@ -607,6 +609,16 @@ def _read_codex_advice(run_id: int) -> dict | None:
         return None
 
 
+def _read_target_feature_debug(run_id: int) -> dict | None:
+    path = Path("artifacts") / "runs" / str(run_id) / "target_feature_debug.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def _run_interactive_retry(run_id: int) -> None:
     db = SessionLocal()
     try:
@@ -673,4 +685,4 @@ def _status_progress(status: str) -> tuple[int, str]:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=False)
