@@ -149,37 +149,6 @@
   </div>
 
   <div class="card">
-    <h2>Target feature debug</h2>
-    {% if target_feature_debug %}
-      <p><strong>URL:</strong> {{ target_feature_debug.target_url }}</p>
-      <p><strong>Fetch method:</strong> {{ target_feature_debug.fetch_method }}</p>
-      <p>
-        <strong>HTML/Text:</strong>
-        {{ target_feature_debug.html_length }} / {{ target_feature_debug.text_length }}
-      </p>
-      <p><strong>Debug file:</strong> artifacts/runs/{{ run.id }}/target_feature_debug.json</p>
-      <p><strong>Title:</strong> {{ target_feature_debug.title or target_feature_debug.title_text }}</p>
-      <p><strong>H1:</strong> {{ (target_feature_debug.h1 or target_feature_debug.h1_list)|join(", ") }}</p>
-      <p>
-        <strong>Extracted:</strong>
-        CTA={{ target_feature_debug.extracted_features.has_cta }},
-        form={{ target_feature_debug.extracted_features.has_forms }},
-        lead={{ target_feature_debug.extracted_features.has_lead_form }},
-        FAQ={{ target_feature_debug.extracted_features.has_faq }},
-        reviews={{ target_feature_debug.extracted_features.has_reviews }},
-        contacts={{ target_feature_debug.extracted_features.has_contacts }},
-        courses={{ target_feature_debug.extracted_features.has_courses }},
-        schema={{ target_feature_debug.extracted_features.has_schema }}
-      </p>
-      <p><strong>LD types:</strong> {{ target_feature_debug.ld_json_types|join(", ") }}</p>
-      <p><strong>First text:</strong> {{ target_feature_debug.first_500_text_chars }}</p>
-      <pre>{{ target_feature_debug.score_debug|tojson(indent=2) }}</pre>
-    {% else %}
-      <p>Target debug пока не сохранен.</p>
-    {% endif %}
-  </div>
-
-  <div class="card">
     <h2>SERP / Intent Summary</h2>
     {% if serp_summary_data and serp_summary_data.summary %}
       <p><strong>Источник:</strong> {{ serp_summary_data.source }}</p>
@@ -402,13 +371,17 @@
   </div>
 
   <div class="card">
-    <h2>Сводка обработки страниц</h2>
+    <h2>Статистика позиций сайтов</h2>
     <p><strong>Скачано страниц:</strong> {{ snapshots|length }}</p>
     <p><strong>Извлечено наборов признаков:</strong> {{ features_count }}</p>
-    {% if snapshots %}
+    {% if snapshot_position_rows %}
       <table class="results-table">
         <thead>
           <tr>
+            <th>Реальная позиция</th>
+            <th>Наша позиция</th>
+            <th>Разница</th>
+            <th>Total score</th>
             <th>Тип</th>
             <th>URL</th>
             <th>Статус загрузки</th>
@@ -416,12 +389,22 @@
           </tr>
         </thead>
         <tbody>
-          {% for snap in snapshots %}
+          {% for row in snapshot_position_rows %}
             <tr>
-              <td>{{ snap.source_type }}</td>
-              <td><a href="{{ snap.source_url }}" target="_blank">{{ snap.source_url }}</a></td>
-              <td>{{ snap.fetch_status }}</td>
-              <td>{{ snap.http_status or "-" }}</td>
+              <td>{{ row.real_position if row.real_position is not none else "-" }}</td>
+              <td>{{ row.our_position if row.our_position is not none else "-" }}</td>
+              <td>
+                {% if row.position_delta is not none %}
+                  {{ "%+d"|format(row.position_delta) }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>{{ row.total_score if row.total_score is not none else "-" }}</td>
+              <td>{{ row.source_type }}</td>
+              <td><a href="{{ row.source_url }}" target="_blank">{{ row.source_url }}</a></td>
+              <td>{{ row.fetch_status }}</td>
+              <td>{{ row.http_status or "-" }}</td>
             </tr>
           {% endfor %}
         </tbody>

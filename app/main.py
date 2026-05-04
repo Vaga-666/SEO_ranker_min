@@ -272,6 +272,7 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     )
     score_map = {row.source_url.rstrip("/"): row for row in page_scores}
     feature_map = {row.source_url.rstrip("/"): row for row in page_features}
+    serp_position_map = {row.url.rstrip("/"): row.position for row in serp_results}
 
     top_rows = []
     for item in serp_results:
@@ -285,6 +286,36 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
                 "total_score": round(score_row.total_score, 2) if score_row else None,
             }
         )
+
+    snapshot_position_rows = []
+    for snap in snapshots:
+        normalized_url = snap.source_url.rstrip("/")
+        score_row = score_map.get(normalized_url)
+        real_position = serp_position_map.get(normalized_url)
+        our_position = score_row.internal_rank if score_row else None
+        position_delta = None
+        if real_position is not None and our_position is not None:
+            position_delta = real_position - our_position
+        snapshot_position_rows.append(
+            {
+                "source_type": snap.source_type,
+                "source_url": snap.source_url,
+                "real_position": real_position,
+                "our_position": our_position,
+                "position_delta": position_delta,
+                "total_score": round(score_row.total_score, 2) if score_row else None,
+                "fetch_status": snap.fetch_status,
+                "http_status": snap.http_status,
+            }
+        )
+    snapshot_position_rows.sort(
+        key=lambda row: (
+            row["our_position"] is None,
+            row["our_position"] or 999999,
+            row["real_position"] or 999999,
+            row["source_url"],
+        )
+    )
 
     target_score = score_map.get(run.target_url.rstrip("/"))
     top_score_rows = [score_map.get(item.url.rstrip("/")) for item in serp_results]
@@ -312,7 +343,6 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     )
     serp_summary_data = _read_serp_summary(run.id)
     codex_advice = _read_codex_advice(run.id)
-    target_feature_debug = _read_target_feature_debug(run.id)
 
     recommendations_by_priority = {
         "urgent": [r for r in recommendations if r.priority == "urgent"],
@@ -354,13 +384,13 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
             "run": run,
             "serp_results": serp_results,
             "snapshots": snapshots,
+            "snapshot_position_rows": snapshot_position_rows,
             "features_count": features_count,
             "top_rows": top_rows,
             "target_vs_top": target_vs_top,
             "gap_report": gap_report,
             "serp_summary_data": serp_summary_data,
             "codex_advice": codex_advice,
-            "target_feature_debug": target_feature_debug,
             "recommendations_by_priority": recommendations_by_priority,
             "is_captcha": run.status == "captcha_detected",
             "is_running": is_running,
@@ -601,16 +631,6 @@ def _read_serp_summary(run_id: int) -> dict | None:
 
 def _read_codex_advice(run_id: int) -> dict | None:
     path = Path("artifacts") / "runs" / str(run_id) / "codex_advice.json"
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def _read_target_feature_debug(run_id: int) -> dict | None:
-    path = Path("artifacts") / "runs" / str(run_id) / "target_feature_debug.json"
     if not path.exists():
         return None
     try:
