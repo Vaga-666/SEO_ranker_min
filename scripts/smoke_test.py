@@ -1,9 +1,17 @@
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.db import Base
+from app.models import AnalysisRun, SerpResult
 from app.services.feature_extractor import extract_page_features
+from app.services.pipeline import run_analysis_with_manual_serp
+from app.services.serp_yandex import is_yandex_captcha_page
 from app.services.scoring import score_page_feature, score_page_feature_debug
 
 
@@ -121,6 +129,53 @@ def main() -> None:
     assert debug.reasons["structure_fit"]["passed_rules"]
     assert debug.reasons["commercial_fit"]["passed_rules"]
     assert debug.reasons["trust_fit"]["passed_rules"]
+    captcha_html = """
+    <html>
+      <head><title>Вы не робот</title></head>
+      <body>
+        <form action="/showcaptcha">
+          <p>Подтвердите, что запросы отправляли вы</p>
+          <input name="captcha" />
+        </form>
+      </body>
+    </html>
+    """
+    assert is_yandex_captcha_page(
+        html=captcha_html,
+        current_url="https://yandex.ru/showcaptcha?cc=1",
+        title="Вы не робот",
+    )
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    try:
+        run = AnalysisRun(query="курсы онлайн обучения", target_url="https://example.com/target", status="created")
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+
+        pages_called = {"value": False}
+
+        def fake_pages(*args, **kwargs):
+            pages_called["value"] = True
+
+        with patch("app.services.pipeline.fetch_yandex_top10", side_effect=AssertionError("collector should not run")):
+            with patch("app.services.pipeline.run_analysis_step_pages", side_effect=fake_pages):
+                run_analysis_with_manual_serp(
+                    db=db,
+                    run=run,
+                    manual_urls=[
+                        "https://competitor.example/course?utm_source=ad&x=1#fragment",
+                        "https://second.example/course",
+                    ],
+                )
+
+        saved_urls = [row.url for row in db.query(SerpResult).order_by(SerpResult.position.asc()).all()]
+        assert pages_called["value"] is True
+        assert saved_urls == ["https://competitor.example/course?x=1", "https://second.example/course"]
+    finally:
+        db.close()
 
     print("smoke_test: OK")
     print(

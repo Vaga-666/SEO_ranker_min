@@ -1,6 +1,5 @@
 ﻿import asyncio
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -26,6 +25,14 @@ class SerpFetchResult:
     screenshot_path: str
     attempts: int
     note: str | None = None
+
+
+class YandexCaptchaDetected(RuntimeError):
+    def __init__(self, current_url: str, html_path: str, screenshot_path: str) -> None:
+        super().__init__("Yandex captcha page detected")
+        self.current_url = current_url
+        self.html_path = html_path
+        self.screenshot_path = screenshot_path
 
 
 def fetch_yandex_top10(query: str, run_dir: Path) -> SerpFetchResult:
@@ -65,13 +72,20 @@ def fetch_yandex_top10(query: str, run_dir: Path) -> SerpFetchResult:
             html = page.content()
             last_html = html
             (run_dir / f"serp_attempt_{attempt}.html").write_text(html, encoding="utf-8")
-            page.screenshot(path=str(run_dir / f"serp_attempt_{attempt}.png"), full_page=True)
+            _safe_screenshot(page, run_dir / f"serp_attempt_{attempt}.png")
 
-            lower_html = html.lower()
-            if _is_captcha_page(lower_html):
+            current_url = page.url
+            title = _safe_title(page)
+            if is_yandex_captcha_page(html=html, current_url=current_url, title=title):
+                html_path.write_text(html, encoding="utf-8")
+                _safe_screenshot(page, screenshot_path)
                 context.close()
                 browser.close()
-                raise RuntimeError("Yandex captcha page detected")
+                raise YandexCaptchaDetected(
+                    current_url=current_url,
+                    html_path=str(html_path),
+                    screenshot_path=str(screenshot_path),
+                )
 
             items = _extract_items_from_dom(page)
             if len(items) < 3:
@@ -79,7 +93,7 @@ def fetch_yandex_top10(query: str, run_dir: Path) -> SerpFetchResult:
 
             if items:
                 html_path.write_text(html, encoding="utf-8")
-                page.screenshot(path=str(screenshot_path), full_page=True)
+                _safe_screenshot(page, screenshot_path)
                 context.close()
                 browser.close()
                 return SerpFetchResult(
@@ -90,14 +104,14 @@ def fetch_yandex_top10(query: str, run_dir: Path) -> SerpFetchResult:
                     note=f"success_after_attempt_{attempt}",
                 )
 
-            if _is_no_results_page(lower_html):
+            if _is_no_results_page(html.lower()):
                 last_note = "no_results_page_detected"
                 break
             last_note = "empty_results_after_attempt"
 
         if last_html:
             html_path.write_text(last_html, encoding="utf-8")
-            page.screenshot(path=str(screenshot_path), full_page=True)
+            _safe_screenshot(page, screenshot_path)
 
         context.close()
         browser.close()
@@ -109,86 +123,6 @@ def fetch_yandex_top10(query: str, run_dir: Path) -> SerpFetchResult:
         attempts=max_attempts,
         note=last_note or "empty_results_after_retries",
     )
-
-
-def fetch_yandex_top10_interactive(
-    query: str,
-    run_dir: Path,
-    manual_wait_sec: int = 240,
-) -> SerpFetchResult:
-    _ensure_windows_proactor_policy()
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-    html_path = run_dir / "serp.html"
-    screenshot_path = run_dir / "serp.png"
-
-    search_url = f"https://yandex.ru/search/?text={quote(query)}&p=0"
-    deadline = time.time() + manual_wait_sec
-    last_html = ""
-    attempt = 0
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(
-            viewport={"width": 1440, "height": 2000},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="ru-RU",
-        )
-        page = context.new_page()
-        page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-
-        while time.time() < deadline:
-            attempt += 1
-            page.wait_for_timeout(2500)
-            html = page.content()
-            last_html = html
-            lower_html = html.lower()
-            (run_dir / f"serp_interactive_attempt_{attempt}.html").write_text(html, encoding="utf-8")
-            page.screenshot(path=str(run_dir / f"serp_interactive_attempt_{attempt}.png"), full_page=True)
-
-            if _is_captcha_page(lower_html):
-                continue
-
-            items = _extract_items_from_dom(page)
-            if len(items) < 3:
-                items = _extract_items_from_html(html)
-
-            if items:
-                html_path.write_text(html, encoding="utf-8")
-                page.screenshot(path=str(screenshot_path), full_page=True)
-                context.close()
-                browser.close()
-                return SerpFetchResult(
-                    items=items[:10],
-                    html_path=str(html_path),
-                    screenshot_path=str(screenshot_path),
-                    attempts=attempt,
-                    note="interactive_success",
-                )
-
-            if _is_no_results_page(lower_html):
-                html_path.write_text(html, encoding="utf-8")
-                page.screenshot(path=str(screenshot_path), full_page=True)
-                context.close()
-                browser.close()
-                return SerpFetchResult(
-                    items=[],
-                    html_path=str(html_path),
-                    screenshot_path=str(screenshot_path),
-                    attempts=attempt,
-                    note="interactive_no_results_page",
-                )
-
-        if last_html:
-            html_path.write_text(last_html, encoding="utf-8")
-            page.screenshot(path=str(screenshot_path), full_page=True)
-        context.close()
-        browser.close()
-
-    raise RuntimeError("Yandex captcha still active after interactive wait timeout")
 
 
 def _extract_items_from_dom(page) -> list[SerpItem]:
@@ -300,12 +234,34 @@ def _is_result_url(href: str) -> bool:
     return True
 
 
-def _is_captcha_page(lower_html: str) -> bool:
-    return (
-        "\u0432\u044b \u043d\u0435 \u0440\u043e\u0431\u043e\u0442" in lower_html
-        or "captcha" in lower_html
-        or "showcaptcha" in lower_html
-        or "not a robot" in lower_html
+def _safe_screenshot(page, path: Path) -> None:
+    try:
+        page.screenshot(path=str(path), full_page=True, timeout=10000)
+    except Exception:
+        return
+
+
+def _safe_title(page) -> str:
+    try:
+        return page.title()
+    except Exception:
+        return ""
+
+
+def is_yandex_captcha_page(html: str, current_url: str = "", title: str = "") -> bool:
+    lower_html = (html or "").lower()
+    lower_url = (current_url or "").lower()
+    lower_title = (title or "").lower()
+    page_text = BeautifulSoup(html or "", "lxml").get_text(" ", strip=True).lower()
+    return any(
+        [
+            "/showcaptcha" in lower_url,
+            "\u0432\u044b \u043d\u0435 \u0440\u043e\u0431\u043e\u0442" in page_text,
+            "\u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u0435, \u0447\u0442\u043e \u0437\u0430\u043f\u0440\u043e\u0441\u044b \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u044f\u043b\u0438 \u0432\u044b" in page_text,
+            "\u0432\u044b \u043d\u0435 \u0440\u043e\u0431\u043e\u0442" in lower_title,
+            "captcha" in lower_html and "<form" in lower_html,
+            "showcaptcha" in lower_html,
+        ]
     )
 
 

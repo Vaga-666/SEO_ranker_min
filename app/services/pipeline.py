@@ -4,7 +4,7 @@ import traceback
 from collections import Counter
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy.orm import Session
 
@@ -17,14 +17,8 @@ from app.services.debug_io import append_run_log, save_run_json
 from app.services.feature_extractor import extract_page_features
 from app.services.gap_analysis import build_basic_gap_recommendations
 from app.services.page_fetch import fetch_page_html
-from app.services.scoring import score_page_feature, score_page_feature_debug
-from app.services.serp_yandex import fetch_yandex_top10, fetch_yandex_top10_interactive
-from app.services.target_debug import (
-    build_target_html_debug,
-    feature_debug_dict,
-    log_payload_fields,
-    score_debug_dict,
-)
+from app.services.scoring import score_page_feature
+from app.services.serp_yandex import YandexCaptchaDetected, fetch_yandex_top10
 
 
 def run_analysis_step_serp(db: Session, run: AnalysisRun) -> None:
@@ -46,13 +40,24 @@ def run_analysis_step_serp(db: Session, run: AnalysisRun) -> None:
             attempts=serp_data.attempts,
             note=serp_data.note,
         )
+    except YandexCaptchaDetected as exc:
+        run.status = "captcha_detected"
+        run.error_message = "Yandex captcha detected. Use manual top-10 URL fallback."
+        db.add(run)
+        db.commit()
+        append_run_log(
+            run.id,
+            "captcha_detected",
+            query=run.query,
+            url=exc.current_url,
+            html_path=exc.html_path,
+            screenshot_path=exc.screenshot_path,
+        )
+        _save_debug_summary(db=db, run=run)
+        return
     except Exception as exc:
         error_text = _format_exception(exc)
-        lowered = error_text.lower()
-        if "captcha" in lowered or "robot" in lowered:
-            run.status = "captcha_detected"
-        else:
-            run.status = "failed"
+        run.status = "failed"
         run.error_message = f"SERP fetch error: {error_text}"
         db.add(run)
         db.commit()
@@ -96,79 +101,6 @@ def run_analysis_step_serp(db: Session, run: AnalysisRun) -> None:
         run_analysis_step_pages(db=db, run=run, run_dir=run_dir)
 
 
-def run_analysis_step_serp_interactive(db: Session, run: AnalysisRun) -> None:
-    append_run_log(run.id, "serp.interactive.start", status=run.status)
-    run.status = "running_interactive_serp"
-    run.error_message = None
-    db.add(run)
-    db.commit()
-
-    run_dir = Path("artifacts") / "runs" / str(run.id)
-    try:
-        serp_data = fetch_yandex_top10_interactive(query=run.query, run_dir=run_dir)
-        append_run_log(
-            run.id,
-            "serp.interactive.fetched",
-            items_count=len(serp_data.items),
-            html_path=serp_data.html_path,
-            screenshot_path=serp_data.screenshot_path,
-            attempts=serp_data.attempts,
-            note=serp_data.note,
-        )
-    except Exception as exc:
-        error_text = _format_exception(exc)
-        lowered = error_text.lower()
-        if "captcha" in lowered or "robot" in lowered:
-            run.status = "captcha_detected"
-        else:
-            run.status = "failed"
-        run.error_message = f"SERP interactive error: {error_text}"
-        db.add(run)
-        db.commit()
-        append_run_log(
-            run.id,
-            "serp.interactive.failed",
-            status=run.status,
-            error=run.error_message,
-            traceback=traceback.format_exc(),
-        )
-        _save_debug_summary(db=db, run=run)
-        return
-
-    db.query(SerpResult).filter(SerpResult.analysis_run_id == run.id).delete()
-    for item in serp_data.items:
-        is_target = _same_domain(item.url, run.target_url)
-        db.add(
-            SerpResult(
-                analysis_run_id=run.id,
-                position=item.position,
-                url=item.url,
-                title=item.title,
-                snippet=item.snippet,
-                domain=item.domain,
-                is_target=is_target,
-            )
-        )
-
-    run.status = "serp_collected_interactive" if serp_data.items else "no_results"
-    if not serp_data.items:
-        run.error_message = f"SERP empty: {serp_data.note or 'unknown_reason'}"
-    else:
-        run.error_message = None
-    db.add(run)
-    db.commit()
-    append_run_log(
-        run.id,
-        "serp.interactive.saved",
-        status=run.status,
-        saved_count=len(serp_data.items),
-    )
-    _save_debug_summary(db=db, run=run)
-
-    if serp_data.items:
-        run_analysis_step_pages(db=db, run=run, run_dir=run_dir)
-
-
 def run_analysis_with_manual_serp(db: Session, run: AnalysisRun, manual_urls: list[str]) -> None:
     append_run_log(run.id, "manual_serp.start", manual_urls_count=len(manual_urls))
     run.status = "running_manual_serp"
@@ -179,8 +111,9 @@ def run_analysis_with_manual_serp(db: Session, run: AnalysisRun, manual_urls: li
     run_dir = Path("artifacts") / "runs" / str(run.id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    normalized_manual_urls = _normalize_manual_urls(manual_urls)
     db.query(SerpResult).filter(SerpResult.analysis_run_id == run.id).delete()
-    for idx, url in enumerate(manual_urls[:10], start=1):
+    for idx, url in enumerate(normalized_manual_urls[:10], start=1):
         domain = urlparse(url).netloc.lower().replace("www.", "")
         db.add(
             SerpResult(
@@ -197,7 +130,7 @@ def run_analysis_with_manual_serp(db: Session, run: AnalysisRun, manual_urls: li
     run.status = "serp_collected_manual"
     db.add(run)
     db.commit()
-    append_run_log(run.id, "manual_serp.saved", status=run.status, saved_count=min(len(manual_urls), 10))
+    append_run_log(run.id, "manual_serp.saved", status=run.status, saved_count=min(len(normalized_manual_urls), 10))
     _save_debug_summary(db=db, run=run)
 
     run_analysis_step_pages(db=db, run=run, run_dir=run_dir)
@@ -261,15 +194,6 @@ def run_analysis_step_pages(db: Session, run: AnalysisRun, run_dir: Path) -> Non
         try:
             html = Path(fetch_result.raw_html_path).read_text(encoding="utf-8", errors="ignore")
             features = extract_page_features(html=html, page_url=url)
-            if source_type == "target":
-                target_debug = build_target_html_debug(
-                    target_url=url,
-                    fetch_method=fetch_result.fetch_method,
-                    html=html,
-                    extracted_features=feature_debug_dict(features),
-                )
-                append_run_log(run.id, "target.html_debug", **log_payload_fields(target_debug))
-                save_run_json(run.id, "target_feature_debug.json", target_debug)
             db.add(
                 PageFeature(
                     analysis_run_id=run.id,
@@ -336,7 +260,6 @@ def run_analysis_step_scoring(db: Session, run: AnalysisRun, had_errors: bool = 
     scores: list[PageScore] = []
     for feature in features:
         score = score_page_feature(query=run.query, feature=feature)
-        score_debug = score_page_feature_debug(query=run.query, feature=feature)
         score_row = PageScore(
             analysis_run_id=run.id,
             source_url=feature.source_url,
@@ -357,8 +280,6 @@ def run_analysis_step_scoring(db: Session, run: AnalysisRun, had_errors: bool = 
             source_type=feature.source_type,
             total_score=score.total_score,
         )
-        if feature.source_type == "target":
-            _save_target_feature_debug(db=db, run=run, feature=feature, score=score, score_reasons=score_debug.reasons)
 
     db.flush()
 
@@ -378,49 +299,6 @@ def run_analysis_step_scoring(db: Session, run: AnalysisRun, had_errors: bool = 
     append_run_log(run.id, "scoring.done", status=run.status, scored_count=len(scores), had_errors=had_errors)
     _save_debug_summary(db=db, run=run)
     run_analysis_step_ai_and_recommendations(db=db, run=run, had_errors=had_errors)
-
-
-def _save_target_feature_debug(
-    *,
-    db: Session,
-    run: AnalysisRun,
-    feature: PageFeature,
-    score: Any,
-    score_reasons: dict[str, Any],
-) -> None:
-    snapshot = (
-        db.query(PageSnapshot)
-        .filter(PageSnapshot.analysis_run_id == run.id, PageSnapshot.source_type == "target")
-        .order_by(PageSnapshot.id.desc())
-        .first()
-    )
-    html = ""
-    html_path = snapshot.raw_html_path if snapshot else None
-    if html_path:
-        try:
-            html = Path(html_path).read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            html = ""
-    payload = build_target_html_debug(
-        target_url=feature.source_url,
-        fetch_method=_infer_fetch_method(snapshot),
-        html=html,
-        extracted_features=feature_debug_dict(feature),
-        calculated_scores=score_debug_dict(score),
-        score_reasons=score_reasons,
-    )
-    append_run_log(run.id, "target.feature_debug_saved", **log_payload_fields(payload))
-    save_run_json(run.id, "target_feature_debug.json", payload)
-
-
-def _infer_fetch_method(snapshot: PageSnapshot | None) -> str:
-    if snapshot is None or not snapshot.raw_html_path:
-        return "unknown"
-    try:
-        html = Path(snapshot.raw_html_path).read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return "unknown"
-    return "playwright_rendered" if "data-seo-ranker-rendered" in html else "httpx"
 
 
 def run_analysis_step_ai_and_recommendations(db: Session, run: AnalysisRun, had_errors: bool = False) -> None:
@@ -621,18 +499,55 @@ def _format_exception(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
+def _normalize_manual_urls(urls: list[str]) -> list[str]:
+    normalized_urls: list[str] = []
+    seen: set[str] = set()
+    for raw_url in urls:
+        parsed = urlparse((raw_url or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        filtered_query = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_") and key.lower() not in {"yclid", "gclid", "fbclid"}
+        ]
+        normalized = urlunparse(
+            parsed._replace(
+                scheme=parsed.scheme.lower(),
+                netloc=parsed.netloc.lower(),
+                query=urlencode(filtered_query, doseq=True),
+                fragment="",
+            )
+        ).rstrip("/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_urls.append(normalized)
+    return normalized_urls[:10]
+
+
 def _save_debug_summary(db: Session, run: AnalysisRun) -> None:
     serp_count = db.query(SerpResult).filter(SerpResult.analysis_run_id == run.id).count()
     snapshot_count = db.query(PageSnapshot).filter(PageSnapshot.analysis_run_id == run.id).count()
     feature_count = db.query(PageFeature).filter(PageFeature.analysis_run_id == run.id).count()
     score_count = db.query(PageScore).filter(PageScore.analysis_run_id == run.id).count()
     rec_count = db.query(Recommendation).filter(Recommendation.analysis_run_id == run.id).count()
+    manual_top_urls_used = (
+        db.query(SerpResult)
+        .filter(SerpResult.analysis_run_id == run.id, SerpResult.snippet == "Imported manually")
+        .count()
+        > 0
+    )
+    captcha_detected = run.status == "captcha_detected"
     payload = {
         "run_id": run.id,
         "query": run.query,
         "target_url": run.target_url,
         "status": run.status,
         "error_message": run.error_message,
+        "captcha_detected": captcha_detected,
+        "manual_top_urls_used": manual_top_urls_used,
+        "serp_source": "manual" if manual_top_urls_used else "yandex",
         "counts": {
             "serp_results": serp_count,
             "page_snapshots": snapshot_count,

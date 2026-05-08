@@ -66,17 +66,28 @@
 
   {% if is_captcha %}
     <div class="card card-warning">
-      <h2>Обнаружена капча Yandex</h2>
+      <h2>Яндекс показал капчу</h2>
       <p>
-        Автоматический сбор SERP остановлен из-за антибот-проверки. Можно повторить запуск через ручной top-10:
-        вставьте список URL на главной странице в поле «Ручной top-10 URL».
+        Автоматический сбор выдачи остановлен. Это нормальная защита Яндекса от автоматических запросов.
+        Вставьте top-10 URL вручную и запустите анализ через ручной режим.
       </p>
-      <form method="post" action="/runs/{{ run.id }}/retry-captcha">
-        <button type="submit">Открыть браузер и пройти капчу</button>
+      <form method="post" action="/analyze">
+        <input type="hidden" name="query" value="{{ run.query }}" />
+        <input type="hidden" name="target_url" value="{{ run.target_url }}" />
+        <label for="manual_top_urls_retry">Ручной top-10 URL</label>
+        <textarea
+          id="manual_top_urls_retry"
+          name="manual_top_urls"
+          rows="8"
+          placeholder="https://site1.ru/page&#10;https://site2.ru/page"
+          required
+        ></textarea>
+        <p class="hint">
+          Откройте выдачу Яндекса в обычном браузере, скопируйте органические ссылки без рекламных UTM-параметров
+          и вставьте по одной ссылке в строку.
+        </p>
+        <button type="submit">Запустить с ручным top-10</button>
       </form>
-      <p class="hint">
-        После нажатия откроется видимое окно браузера. Пройдите капчу вручную и подождите, пока система соберет выдачу.
-      </p>
     </div>
   {% endif %}
 
@@ -97,7 +108,7 @@
         <thead>
           <tr>
             <th>Реальная позиция</th>
-            <th>Наша позиция</th>
+            <th>Позиция по score</th>
             <th>URL</th>
             <th>Title</th>
             <th>Total score</th>
@@ -110,13 +121,87 @@
               <td>{{ row.our_position or "-" }}</td>
               <td><a href="{{ row.url }}" target="_blank">{{ row.url }}</a></td>
               <td>{{ row.title }}</td>
-              <td>{{ row.total_score if row.total_score is not none else "-" }}</td>
+              <td>
+                {% if row.total_score is not none %}
+                  {{ "%.2f"|format(row.total_score) }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
             </tr>
           {% endfor %}
         </tbody>
       </table>
     {% else %}
       <p>Результаты SERP пока не собраны.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Позиция target-страницы</h2>
+    {% if target_position_summary %}
+      {% if target_position_summary.is_local_url %}
+        <p class="hint">
+          Это локальный URL. Он не может быть найден в реальной выдаче. Для SEO-проверки используйте боевой URL.
+        </p>
+      {% endif %}
+
+      <table class="results-table">
+        <tbody>
+          <tr>
+            <th>Target URL</th>
+            <td><a href="{{ target_position_summary.target_url }}" target="_blank">{{ target_position_summary.target_url }}</a></td>
+          </tr>
+          <tr>
+            <th>Target total_score</th>
+            <td>{{ "%.2f"|format(target_position_summary.target_total_score) }}</td>
+          </tr>
+          <tr>
+            <th>Средний top-10 total_score</th>
+            <td>
+              {% if target_position_summary.top_avg_total_score is not none %}
+                {{ "%.2f"|format(target_position_summary.top_avg_total_score) }}
+              {% else %}
+                -
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <th>Страниц выше target по score</th>
+            <td>{{ target_position_summary.higher_count }}</td>
+          </tr>
+          <tr>
+            <th>Страниц с score равным target</th>
+            <td>{{ target_position_summary.equal_count }}</td>
+          </tr>
+          <tr>
+            <th>Позиция по score</th>
+            <td>{{ target_position_summary.score_rank }}</td>
+          </tr>
+          <tr>
+            <th>Internal rank</th>
+            <td>{{ target_position_summary.internal_rank or "-" }}</td>
+          </tr>
+          <tr>
+            <th>Real SERP position</th>
+            <td>
+              {% if target_position_summary.is_found_in_serp %}
+                {{ target_position_summary.real_position }}
+              {% else %}
+                target не найден в реальном top-10
+              {% endif %}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      {% if target_position_summary.has_equal_scores %}
+        <p class="hint">
+          У нескольких страниц одинаковый внутренний score. Позиция внутри этой группы не означает существенного SEO-разрыва.
+        </p>
+      {% endif %}
+    {% else %}
+      <p>Target-страница еще не получила внутренний score.</p>
     {% endif %}
   </div>
 
@@ -379,7 +464,7 @@
         <thead>
           <tr>
             <th>Реальная позиция</th>
-            <th>Наша позиция</th>
+            <th>Позиция по score</th>
             <th>Разница</th>
             <th>Total score</th>
             <th>Тип</th>
@@ -400,7 +485,13 @@
                   -
                 {% endif %}
               </td>
-              <td>{{ row.total_score if row.total_score is not none else "-" }}</td>
+              <td>
+                {% if row.total_score is not none %}
+                  {{ "%.2f"|format(row.total_score) }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
               <td>{{ row.source_type }}</td>
               <td><a href="{{ row.source_url }}" target="_blank">{{ row.source_url }}</a></td>
               <td>{{ row.fetch_status }}</td>

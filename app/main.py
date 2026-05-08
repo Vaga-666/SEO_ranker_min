@@ -5,6 +5,7 @@ import sys
 import threading
 import uuid
 from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -21,7 +22,6 @@ from app.models import AnalysisRun, KeywordEntry, PageFeature, PageScore, PageSn
 from app.services.pipeline import (
     run_analysis_step_ai_and_recommendations,
     run_analysis_step_serp,
-    run_analysis_step_serp_interactive,
     run_analysis_with_manual_serp,
 )
 from app.services.keyword_research import KeywordDiscoveryError, discover_keywords
@@ -64,26 +64,6 @@ def start_analysis(
         args=(run.id, manual_urls),
         daemon=True,
     )
-    thread.start()
-
-    return RedirectResponse(
-        url=request.url_for("analysis_detail", run_id=run.id),
-        status_code=303,
-    )
-
-
-@app.post("/runs/{run_id}/retry-captcha")
-def retry_captcha(run_id: int, request: Request, db: Session = Depends(get_db)):
-    run = db.get(AnalysisRun, run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    run.status = "running_interactive_serp"
-    run.error_message = "Идет интерактивный режим: пройдите капчу в браузере..."
-    db.add(run)
-    db.commit()
-
-    thread = threading.Thread(target=_run_interactive_retry, args=(run.id,), daemon=True)
     thread.start()
 
     return RedirectResponse(
@@ -212,10 +192,8 @@ def rerun_ai_codex(run_id: int, request: Request, db: Session = Depends(get_db))
         "created",
         "running",
         "running_manual_serp",
-        "running_interactive_serp",
         "serp_collected",
         "serp_collected_manual",
-        "serp_collected_interactive",
         "pages_processed",
         "pages_processed_partial",
         "scored",
@@ -273,14 +251,16 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     score_map = {row.source_url.rstrip("/"): row for row in page_scores}
     feature_map = {row.source_url.rstrip("/"): row for row in page_features}
     serp_position_map = {row.url.rstrip("/"): row.position for row in serp_results}
+    score_rank_map = _build_score_rank_map(page_scores)
 
     top_rows = []
     for item in serp_results:
         score_row = score_map.get(item.url.rstrip("/"))
+        normalized_url = item.url.rstrip("/")
         top_rows.append(
             {
                 "real_position": item.position,
-                "our_position": score_row.internal_rank if score_row else None,
+                "our_position": score_rank_map.get(normalized_url),
                 "url": item.url,
                 "title": item.title,
                 "total_score": round(score_row.total_score, 2) if score_row else None,
@@ -292,7 +272,7 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
         normalized_url = snap.source_url.rstrip("/")
         score_row = score_map.get(normalized_url)
         real_position = serp_position_map.get(normalized_url)
-        our_position = score_row.internal_rank if score_row else None
+        our_position = score_rank_map.get(normalized_url)
         position_delta = None
         if real_position is not None and our_position is not None:
             position_delta = real_position - our_position
@@ -321,6 +301,13 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     top_score_rows = [score_map.get(item.url.rstrip("/")) for item in serp_results]
     top_score_rows = [row for row in top_score_rows if row is not None]
     top_avg = _calc_avg_scores(top_score_rows)
+    target_position_summary = _build_target_position_summary(
+        run=run,
+        target_score=target_score,
+        page_scores=page_scores,
+        serp_position_map=serp_position_map,
+        top_avg=top_avg,
+    )
 
     target_vs_top = None
     if target_score and top_avg:
@@ -353,11 +340,9 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
         "created",
         "running",
         "running_manual_serp",
-        "running_interactive_serp",
         "running_ai_codex_manual",
         "serp_collected",
         "serp_collected_manual",
-        "serp_collected_interactive",
         "pages_processed",
         "pages_processed_partial",
         "scored",
@@ -366,7 +351,6 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
     is_running = run.status in running_statuses
     running_seconds = int((datetime.utcnow() - run.created_at).total_seconds()) if is_running else 0
     status_hints = {
-        "running_interactive_serp": "Открыто окно браузера, пройдите капчу и дождитесь завершения.",
         "running_ai_codex_manual": "Выполняем повторный AI-анализ и формируем рекомендации для Codex.",
         "running": "Идет сбор SERP.",
         "running_manual_serp": "Применяется ручной список top-10.",
@@ -387,6 +371,7 @@ def analysis_detail(run_id: int, request: Request, db: Session = Depends(get_db)
             "snapshot_position_rows": snapshot_position_rows,
             "features_count": features_count,
             "top_rows": top_rows,
+            "target_position_summary": target_position_summary,
             "target_vs_top": target_vs_top,
             "gap_report": gap_report,
             "serp_summary_data": serp_summary_data,
@@ -447,22 +432,88 @@ def _calc_avg_scores(rows: list[PageScore]) -> dict[str, float] | None:
     }
 
 
+def _build_score_rank_map(scores: list[PageScore]) -> dict[str, int]:
+    rounded_scores = [round(row.total_score, 2) for row in scores]
+    rank_map: dict[str, int] = {}
+    for row in scores:
+        score = round(row.total_score, 2)
+        rank_map[row.source_url.rstrip("/")] = sum(1 for other in rounded_scores if other > score) + 1
+    return rank_map
+
+
+def _build_target_position_summary(
+    run: AnalysisRun,
+    target_score: PageScore | None,
+    page_scores: list[PageScore],
+    serp_position_map: dict[str, int],
+    top_avg: dict[str, float] | None,
+) -> dict | None:
+    if target_score is None:
+        return None
+
+    target_url = run.target_url
+    normalized_target_url = target_url.rstrip("/")
+    target_total_score = round(target_score.total_score, 2)
+    comparable_scores = [
+        row for row in page_scores if row.source_url.rstrip("/") != normalized_target_url
+    ]
+    rounded_scores = [round(row.total_score, 2) for row in comparable_scores]
+    higher_count = sum(1 for score in rounded_scores if score > target_total_score)
+    equal_count = sum(1 for score in rounded_scores if score == target_total_score)
+    real_position = serp_position_map.get(normalized_target_url)
+
+    parsed = urlparse(target_url)
+    hostname = (parsed.hostname or "").lower()
+    is_local_url = hostname in {"127.0.0.1", "localhost"} or hostname.startswith("127.")
+
+    return {
+        "target_url": target_url,
+        "target_total_score": target_total_score,
+        "top_avg_total_score": top_avg["total_score"] if top_avg else None,
+        "higher_count": higher_count,
+        "equal_count": equal_count,
+        "score_rank": higher_count + 1,
+        "internal_rank": target_score.internal_rank,
+        "real_position": real_position,
+        "is_found_in_serp": real_position is not None,
+        "is_local_url": is_local_url,
+        "has_equal_scores": equal_count > 0,
+    }
+
+
+def _normalize_manual_url(url: str) -> str | None:
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    filtered_query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.lower().startswith("utm_") and key.lower() not in {"yclid", "gclid", "fbclid"}
+    ]
+    normalized = parsed._replace(
+        scheme=parsed.scheme.lower(),
+        netloc=parsed.netloc.lower(),
+        query=urlencode(filtered_query, doseq=True),
+        fragment="",
+    )
+    return urlunparse(normalized).rstrip("/")
+
+
 def _parse_manual_urls(raw: str) -> list[str]:
     urls: list[str] = []
     for line in (raw or "").splitlines():
-        url = line.strip()
+        url = _normalize_manual_url(line)
         if not url:
             continue
-        if url.startswith("http://") or url.startswith("https://"):
-            urls.append(url)
+        urls.append(url)
 
     deduplicated: list[str] = []
     seen: set[str] = set()
     for url in urls:
-        key = url.rstrip("/")
-        if key in seen:
+        if url in seen:
             continue
-        seen.add(key)
+        seen.add(url)
         deduplicated.append(url)
 
     return deduplicated[:10]
@@ -639,17 +690,6 @@ def _read_codex_advice(run_id: int) -> dict | None:
         return None
 
 
-def _run_interactive_retry(run_id: int) -> None:
-    db = SessionLocal()
-    try:
-        run = db.get(AnalysisRun, run_id)
-        if run is None:
-            return
-        run_analysis_step_serp_interactive(db=db, run=run)
-    finally:
-        db.close()
-
-
 def _run_analysis_background(run_id: int, manual_urls: list[str] | None = None) -> None:
     db = SessionLocal()
     try:
@@ -682,11 +722,9 @@ def _status_progress(status: str) -> tuple[int, str]:
         "created": (3, "Создаем задачу..."),
         "running": (15, "Собираем SERP..."),
         "running_manual_serp": (15, "Применяем ручной top-10..."),
-        "running_interactive_serp": (15, "Ожидаем прохождение капчи..."),
         "running_ai_codex_manual": (88, "Пересчитываем AI-анализ и рекомендации для Codex..."),
         "serp_collected": (35, "SERP собран, начинаем обработку страниц..."),
         "serp_collected_manual": (35, "Top-10 импортирован, начинаем обработку страниц..."),
-        "serp_collected_interactive": (35, "SERP собран после капчи, начинаем обработку страниц..."),
         "pages_processed": (65, "Признаки страниц собраны, считаем score..."),
         "pages_processed_partial": (65, "Часть страниц обработана, считаем score..."),
         "scored": (82, "Скоры рассчитаны, запускаем AI-анализ..."),
